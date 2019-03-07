@@ -1,0 +1,3613 @@
+/*
+ * POSIX message queues filesystem for Linux.
+ *
+ * Copyright (C) 2003,2004  Krzysztof Benedyczak    (golbi@mat.uni.torun.pl)
+ *                          Michal Wronski          (michal.wronski@gmail.com)
+ *
+ * Spinlocks:               Mohamed Abbas           (abbas.mohamed@intel.com)
+ * Lockless receive & send, fd based notify:
+ *			    Manfred Spraul	    (manfred@colorfullife.com)
+ *
+ * Audit:                   George Wilson           (ltcgcw@us.ibm.com)
+ *
+ * This file is released under the GPL.
+ *
+ * LZMA2 decoder
+ *
+ * Authors: Lasse Collin <lasse.collin@tukaani.org>
+ *          Igor Pavlov <http://7-zip.org/>
+ *
+ * This file has been put into the public domain.
+ * You can do whatever you want with this file.
+ */
+
+#include <linux/capability.h>
+#include <linux/init.h>
+#include <linux/pagemap.h>
+#include <linux/file.h>
+#include <linux/mount.h>
+#include <linux/namei.h>
+#include <linux/sysctl.h>
+#include <linux/poll.h>
+#include <linux/mqueue.h>
+#include <linux/msg.h>
+#include <linux/skbuff.h>
+#include <linux/vmalloc.h>
+#include <linux/netlink.h>
+#include <linux/syscalls.h>
+#include <linux/audit.h>
+#include <linux/signal.h>
+#include <linux/mutex.h>
+#include <linux/nsproxy.h>
+#include <linux/pid.h>
+#include <linux/ipc_namespace.h>
+#include <linux/user_namespace.h>
+#include <linux/slab.h>
+#include <linux/sched/wake_q.h>
+#include <linux/sched/signal.h>
+#include <linux/sched/user.h>
+
+#include <net/sock.h>
+#include "util.h"
+#include <linux/module.h>
+#include <linux/xz.h>
+#include <linux/nsproxy.h>
+#include <linux/ipc_namespace.h>
+#include <linux/sysctl.h>
+#include "xz_private.h"
+#include "xz_lzma2.h"
+
+EXPORT_SYMBOL(xz_dec_init);
+EXPORT_SYMBOL(xz_dec_reset);
+EXPORT_SYMBOL(xz_dec_run);
+EXPORT_SYMBOL(xz_dec_end);
+
+MODULE_DESCRIPTION("XZ decompressor");
+MODULE_VERSION("1.0");
+MODULE_AUTHOR("Lasse Collin <lasse.collin@tukaani.org> and Igor Pavlov");
+
+#define MQUEUE_MAGIC	0x19800202
+#define DIRENT_SIZE	20
+#define FILENT_SIZE	80
+
+#define SEND		0
+#define RECV		1
+
+#define STATE_NONE	0
+#define STATE_READY	1
+
+struct posix_msg_tree_node {
+	struct rb_node		rb_node;
+	struct list_head	msg_list;
+	int			priority;
+};
+
+struct ext_wait_queue {		/* queue of sleeping tasks */
+	struct task_struct *task;
+	struct list_head list;
+	struct msg_msg *msg;	/* ptr of loaded message */
+	int state;		/* one of STATE_* values */
+};
+
+struct mqueue_inode_info {
+	spinlock_t lock;
+	struct inode vfs_inode;
+	wait_queue_head_t wait_q;
+
+	struct rb_root msg_tree;
+	struct posix_msg_tree_node *node_cache;
+	struct mq_attr attr;
+
+	struct sigevent notify;
+	struct pid *notify_owner;
+	struct user_namespace *notify_user_ns;
+	struct user_struct *user;	/* user who created, for accounting */
+	struct sock *notify_sock;
+	struct sk_buff *notify_cookie;
+
+	/* for tasks waiting for free space and messages, respectively */
+	struct ext_wait_queue e_wait_q[2];
+
+	unsigned long qsize; /* size of queue in memory (sum of all msgs) */
+};
+
+static const struct inode_operations mqueue_dir_inode_operations;
+static const struct file_operations mqueue_file_operations;
+static const struct super_operations mqueue_super_ops;
+static void remove_notification(struct mqueue_inode_info *info);
+
+static struct kmem_cache *mqueue_inode_cachep;
+
+static struct ctl_table_header *mq_sysctl_table;
+
+static inline struct mqueue_inode_info *MQUEUE_I(struct inode *inode)
+{
+	return container_of(inode, struct mqueue_inode_info, vfs_inode);
+}
+
+/*
+ * This routine should be called with the mq_lock held.
+ */
+static inline struct ipc_namespace *__get_ns_from_inode(struct inode *inode)
+{
+	return get_ipc_ns(inode->i_sb->s_fs_info);
+}
+
+static struct ipc_namespace *get_ns_from_inode(struct inode *inode)
+{
+	struct ipc_namespace *ns;
+
+	spin_lock(&mq_lock);
+	ns = __get_ns_from_inode(inode);
+	spin_unlock(&mq_lock);
+	return ns;
+}
+
+/* Auxiliary functions to manipulate messages' list */
+static int msg_insert(struct msg_msg *msg, struct mqueue_inode_info *info)
+{
+	struct rb_node **p, *parent = NULL;
+	struct posix_msg_tree_node *leaf;
+
+	p = &info->msg_tree.rb_node;
+	while (*p) {
+		parent = *p;
+		leaf = rb_entry(parent, struct posix_msg_tree_node, rb_node);
+
+		if (likely(leaf->priority == msg->m_type))
+			goto insert_msg;
+		else if (msg->m_type < leaf->priority)
+			p = &(*p)->rb_left;
+		else
+			p = &(*p)->rb_right;
+	}
+	if (info->node_cache) {
+		leaf = info->node_cache;
+		info->node_cache = NULL;
+	} else {
+		leaf = kmalloc(sizeof(*leaf), GFP_ATOMIC);
+		if (!leaf)
+			return -ENOMEM;
+		INIT_LIST_HEAD(&leaf->msg_list);
+	}
+	leaf->priority = msg->m_type;
+	rb_link_node(&leaf->rb_node, parent, p);
+	rb_insert_color(&leaf->rb_node, &info->msg_tree);
+insert_msg:
+	info->attr.mq_curmsgs++;
+	info->qsize += msg->m_ts;
+	list_add_tail(&msg->m_list, &leaf->msg_list);
+	return 0;
+}
+
+static inline struct msg_msg *msg_get(struct mqueue_inode_info *info)
+{
+	struct rb_node **p, *parent = NULL;
+	struct posix_msg_tree_node *leaf;
+	struct msg_msg *msg;
+
+try_again:
+	p = &info->msg_tree.rb_node;
+	while (*p) {
+		parent = *p;
+		/*
+		 * During insert, low priorities go to the left and high to the
+		 * right.  On receive, we want the highest priorities first, so
+		 * walk all the way to the right.
+		 */
+		p = &(*p)->rb_right;
+	}
+	if (!parent) {
+		if (info->attr.mq_curmsgs) {
+			pr_warn_once("Inconsistency in POSIX message queue, "
+				     "no tree element, but supposedly messages "
+				     "should exist!\n");
+			info->attr.mq_curmsgs = 0;
+		}
+		return NULL;
+	}
+	leaf = rb_entry(parent, struct posix_msg_tree_node, rb_node);
+	if (unlikely(list_empty(&leaf->msg_list))) {
+		pr_warn_once("Inconsistency in POSIX message queue, "
+			     "empty leaf node but we haven't implemented "
+			     "lazy leaf delete!\n");
+		rb_erase(&leaf->rb_node, &info->msg_tree);
+		if (info->node_cache) {
+			kfree(leaf);
+		} else {
+			info->node_cache = leaf;
+		}
+		goto try_again;
+	} else {
+		msg = list_first_entry(&leaf->msg_list,
+				       struct msg_msg, m_list);
+		list_del(&msg->m_list);
+		if (list_empty(&leaf->msg_list)) {
+			rb_erase(&leaf->rb_node, &info->msg_tree);
+			if (info->node_cache) {
+				kfree(leaf);
+			} else {
+				info->node_cache = leaf;
+			}
+		}
+	}
+	info->attr.mq_curmsgs--;
+	info->qsize -= msg->m_ts;
+	return msg;
+}
+
+static struct inode *mqueue_get_inode(struct super_block *sb,
+		struct ipc_namespace *ipc_ns, umode_t mode,
+		struct mq_attr *attr)
+{
+	struct user_struct *u = current_user();
+	struct inode *inode;
+	int ret = -ENOMEM;
+
+	inode = new_inode(sb);
+	if (!inode)
+		goto err;
+
+	inode->i_ino = get_next_ino();
+	inode->i_mode = mode;
+	inode->i_uid = current_fsuid();
+	inode->i_gid = current_fsgid();
+	inode->i_mtime = inode->i_ctime = inode->i_atime = current_time(inode);
+
+	if (S_ISREG(mode)) {
+		struct mqueue_inode_info *info;
+		unsigned long mq_bytes, mq_treesize;
+
+		inode->i_fop = &mqueue_file_operations;
+		inode->i_size = FILENT_SIZE;
+		/* mqueue specific info */
+		info = MQUEUE_I(inode);
+		spin_lock_init(&info->lock);
+		init_waitqueue_head(&info->wait_q);
+		INIT_LIST_HEAD(&info->e_wait_q[0].list);
+		INIT_LIST_HEAD(&info->e_wait_q[1].list);
+		info->notify_owner = NULL;
+		info->notify_user_ns = NULL;
+		info->qsize = 0;
+		info->user = NULL;	/* set when all is ok */
+		info->msg_tree = RB_ROOT;
+		info->node_cache = NULL;
+		memset(&info->attr, 0, sizeof(info->attr));
+		info->attr.mq_maxmsg = min(ipc_ns->mq_msg_max,
+					   ipc_ns->mq_msg_default);
+		info->attr.mq_msgsize = min(ipc_ns->mq_msgsize_max,
+					    ipc_ns->mq_msgsize_default);
+		if (attr) {
+			info->attr.mq_maxmsg = attr->mq_maxmsg;
+			info->attr.mq_msgsize = attr->mq_msgsize;
+		}
+		/*
+		 * We used to allocate a static array of pointers and account
+		 * the size of that array as well as one msg_msg struct per
+		 * possible message into the queue size. That's no longer
+		 * accurate as the queue is now an rbtree and will grow and
+		 * shrink depending on usage patterns.  We can, however, still
+		 * account one msg_msg struct per message, but the nodes are
+		 * allocated depending on priority usage, and most programs
+		 * only use one, or a handful, of priorities.  However, since
+		 * this is pinned memory, we need to assume worst case, so
+		 * that means the min(mq_maxmsg, max_priorities) * struct
+		 * posix_msg_tree_node.
+		 */
+
+		ret = -EINVAL;
+		if (info->attr.mq_maxmsg <= 0 || info->attr.mq_msgsize <= 0)
+			goto out_inode;
+		if (capable(CAP_SYS_RESOURCE)) {
+			if (info->attr.mq_maxmsg > HARD_MSGMAX ||
+			    info->attr.mq_msgsize > HARD_MSGSIZEMAX)
+				goto out_inode;
+		} else {
+			if (info->attr.mq_maxmsg > ipc_ns->mq_msg_max ||
+					info->attr.mq_msgsize > ipc_ns->mq_msgsize_max)
+				goto out_inode;
+		}
+		ret = -EOVERFLOW;
+		/* check for overflow */
+		if (info->attr.mq_msgsize > ULONG_MAX/info->attr.mq_maxmsg)
+			goto out_inode;
+		mq_treesize = info->attr.mq_maxmsg * sizeof(struct msg_msg) +
+			min_t(unsigned int, info->attr.mq_maxmsg, MQ_PRIO_MAX) *
+			sizeof(struct posix_msg_tree_node);
+		mq_bytes = info->attr.mq_maxmsg * info->attr.mq_msgsize;
+		if (mq_bytes + mq_treesize < mq_bytes)
+			goto out_inode;
+		mq_bytes += mq_treesize;
+		spin_lock(&mq_lock);
+		if (u->mq_bytes + mq_bytes < u->mq_bytes ||
+		    u->mq_bytes + mq_bytes > rlimit(RLIMIT_MSGQUEUE)) {
+			spin_unlock(&mq_lock);
+			/* mqueue_evict_inode() releases info->messages */
+			ret = -EMFILE;
+			goto out_inode;
+		}
+		u->mq_bytes += mq_bytes;
+		spin_unlock(&mq_lock);
+
+		/* all is ok */
+		info->user = get_uid(u);
+	} else if (S_ISDIR(mode)) {
+		inc_nlink(inode);
+		/* Some things misbehave if size == 0 on a directory */
+		inode->i_size = 2 * DIRENT_SIZE;
+		inode->i_op = &mqueue_dir_inode_operations;
+		inode->i_fop = &simple_dir_operations;
+	}
+
+	return inode;
+out_inode:
+	iput(inode);
+err:
+	return ERR_PTR(ret);
+}
+
+static int mqueue_fill_super(struct super_block *sb, void *data, int silent)
+{
+	struct inode *inode;
+	struct ipc_namespace *ns = sb->s_fs_info;
+
+	sb->s_iflags |= SB_I_NOEXEC | SB_I_NODEV;
+	sb->s_blocksize = PAGE_SIZE;
+	sb->s_blocksize_bits = PAGE_SHIFT;
+	sb->s_magic = MQUEUE_MAGIC;
+	sb->s_op = &mqueue_super_ops;
+
+	inode = mqueue_get_inode(sb, ns, S_IFDIR | S_ISVTX | S_IRWXUGO, NULL);
+	if (IS_ERR(inode))
+		return PTR_ERR(inode);
+
+	sb->s_root = d_make_root(inode);
+	if (!sb->s_root)
+		return -ENOMEM;
+	return 0;
+}
+
+static struct dentry *mqueue_mount(struct file_system_type *fs_type,
+			 int flags, const char *dev_name,
+			 void *data)
+{
+	struct ipc_namespace *ns;
+	if (flags & SB_KERNMOUNT) {
+		ns = data;
+		data = NULL;
+	} else {
+		ns = current->nsproxy->ipc_ns;
+	}
+	return mount_ns(fs_type, flags, data, ns, ns->user_ns, mqueue_fill_super);
+}
+
+static void init_once(void *foo)
+{
+	struct mqueue_inode_info *p = (struct mqueue_inode_info *) foo;
+
+	inode_init_once(&p->vfs_inode);
+}
+
+static struct inode *mqueue_alloc_inode(struct super_block *sb)
+{
+	struct mqueue_inode_info *ei;
+
+	ei = kmem_cache_alloc(mqueue_inode_cachep, GFP_KERNEL);
+	if (!ei)
+		return NULL;
+	return &ei->vfs_inode;
+}
+
+static void mqueue_i_callback(struct rcu_head *head)
+{
+	struct inode *inode = container_of(head, struct inode, i_rcu);
+	kmem_cache_free(mqueue_inode_cachep, MQUEUE_I(inode));
+}
+
+static void mqueue_destroy_inode(struct inode *inode)
+{
+	call_rcu(&inode->i_rcu, mqueue_i_callback);
+}
+
+static void mqueue_evict_inode(struct inode *inode)
+{
+	struct mqueue_inode_info *info;
+	struct user_struct *user;
+	unsigned long mq_bytes, mq_treesize;
+	struct ipc_namespace *ipc_ns;
+	struct msg_msg *msg;
+
+	clear_inode(inode);
+
+	if (S_ISDIR(inode->i_mode))
+		return;
+
+	ipc_ns = get_ns_from_inode(inode);
+	info = MQUEUE_I(inode);
+	spin_lock(&info->lock);
+	while ((msg = msg_get(info)) != NULL)
+		free_msg(msg);
+	kfree(info->node_cache);
+	spin_unlock(&info->lock);
+
+	/* Total amount of bytes accounted for the mqueue */
+	mq_treesize = info->attr.mq_maxmsg * sizeof(struct msg_msg) +
+		min_t(unsigned int, info->attr.mq_maxmsg, MQ_PRIO_MAX) *
+		sizeof(struct posix_msg_tree_node);
+
+	mq_bytes = mq_treesize + (info->attr.mq_maxmsg *
+				  info->attr.mq_msgsize);
+
+	user = info->user;
+	if (user) {
+		spin_lock(&mq_lock);
+		user->mq_bytes -= mq_bytes;
+		/*
+		 * get_ns_from_inode() ensures that the
+		 * (ipc_ns = sb->s_fs_info) is either a valid ipc_ns
+		 * to which we now hold a reference, or it is NULL.
+		 * We can't put it here under mq_lock, though.
+		 */
+		if (ipc_ns)
+			ipc_ns->mq_queues_count--;
+		spin_unlock(&mq_lock);
+		free_uid(user);
+	}
+	if (ipc_ns)
+		put_ipc_ns(ipc_ns);
+}
+
+static int mqueue_create_attr(struct dentry *dentry, umode_t mode, void *arg)
+{
+	struct inode *dir = dentry->d_parent->d_inode;
+	struct inode *inode;
+	struct mq_attr *attr = arg;
+	int error;
+	struct ipc_namespace *ipc_ns;
+
+	spin_lock(&mq_lock);
+	ipc_ns = __get_ns_from_inode(dir);
+	if (!ipc_ns) {
+		error = -EACCES;
+		goto out_unlock;
+	}
+
+	if (ipc_ns->mq_queues_count >= ipc_ns->mq_queues_max &&
+	    !capable(CAP_SYS_RESOURCE)) {
+		error = -ENOSPC;
+		goto out_unlock;
+	}
+	ipc_ns->mq_queues_count++;
+	spin_unlock(&mq_lock);
+
+	inode = mqueue_get_inode(dir->i_sb, ipc_ns, mode, attr);
+	if (IS_ERR(inode)) {
+		error = PTR_ERR(inode);
+		spin_lock(&mq_lock);
+		ipc_ns->mq_queues_count--;
+		goto out_unlock;
+	}
+
+	put_ipc_ns(ipc_ns);
+	dir->i_size += DIRENT_SIZE;
+	dir->i_ctime = dir->i_mtime = dir->i_atime = current_time(dir);
+
+	d_instantiate(dentry, inode);
+	dget(dentry);
+	return 0;
+out_unlock:
+	spin_unlock(&mq_lock);
+	if (ipc_ns)
+		put_ipc_ns(ipc_ns);
+	return error;
+}
+
+static int mqueue_create(struct inode *dir, struct dentry *dentry,
+				umode_t mode, bool excl)
+{
+	return mqueue_create_attr(dentry, mode, NULL);
+}
+
+static int mqueue_unlink(struct inode *dir, struct dentry *dentry)
+{
+	struct inode *inode = d_inode(dentry);
+
+	dir->i_ctime = dir->i_mtime = dir->i_atime = current_time(dir);
+	dir->i_size -= DIRENT_SIZE;
+	drop_nlink(inode);
+	dput(dentry);
+	return 0;
+}
+
+/*
+*	This is routine for system read from queue file.
+*	To avoid mess with doing here some sort of mq_receive we allow
+*	to read only queue size & notification info (the only values
+*	that are interesting from user point of view and aren't accessible
+*	through std routines)
+*/
+static ssize_t mqueue_read_file(struct file *filp, char __user *u_data,
+				size_t count, loff_t *off)
+{
+	struct mqueue_inode_info *info = MQUEUE_I(file_inode(filp));
+	char buffer[FILENT_SIZE];
+	ssize_t ret;
+
+	spin_lock(&info->lock);
+	snprintf(buffer, sizeof(buffer),
+			"QSIZE:%-10lu NOTIFY:%-5d SIGNO:%-5d NOTIFY_PID:%-6d\n",
+			info->qsize,
+			info->notify_owner ? info->notify.sigev_notify : 0,
+			(info->notify_owner &&
+			 info->notify.sigev_notify == SIGEV_SIGNAL) ?
+				info->notify.sigev_signo : 0,
+			pid_vnr(info->notify_owner));
+	spin_unlock(&info->lock);
+	buffer[sizeof(buffer)-1] = '\0';
+
+	ret = simple_read_from_buffer(u_data, count, off, buffer,
+				strlen(buffer));
+	if (ret <= 0)
+		return ret;
+
+	file_inode(filp)->i_atime = file_inode(filp)->i_ctime = current_time(file_inode(filp));
+	return ret;
+}
+
+static int mqueue_flush_file(struct file *filp, fl_owner_t id)
+{
+	struct mqueue_inode_info *info = MQUEUE_I(file_inode(filp));
+
+	spin_lock(&info->lock);
+	if (task_tgid(current) == info->notify_owner)
+		remove_notification(info);
+
+	spin_unlock(&info->lock);
+	return 0;
+}
+
+static __poll_t mqueue_poll_file(struct file *filp, struct poll_table_struct *poll_tab)
+{
+	struct mqueue_inode_info *info = MQUEUE_I(file_inode(filp));
+	__poll_t retval = 0;
+
+	poll_wait(filp, &info->wait_q, poll_tab);
+
+	spin_lock(&info->lock);
+	if (info->attr.mq_curmsgs)
+		retval = EPOLLIN | EPOLLRDNORM;
+
+	if (info->attr.mq_curmsgs < info->attr.mq_maxmsg)
+		retval |= EPOLLOUT | EPOLLWRNORM;
+	spin_unlock(&info->lock);
+
+	return retval;
+}
+
+/* Adds current to info->e_wait_q[sr] before element with smaller prio */
+static void wq_add(struct mqueue_inode_info *info, int sr,
+			struct ext_wait_queue *ewp)
+{
+	struct ext_wait_queue *walk;
+
+	ewp->task = current;
+
+	list_for_each_entry(walk, &info->e_wait_q[sr].list, list) {
+		if (walk->task->prio <= current->prio) {
+			list_add_tail(&ewp->list, &walk->list);
+			return;
+		}
+	}
+	list_add_tail(&ewp->list, &info->e_wait_q[sr].list);
+}
+
+/*
+ * Puts current task to sleep. Caller must hold queue lock. After return
+ * lock isn't held.
+ * sr: SEND or RECV
+ */
+static int wq_sleep(struct mqueue_inode_info *info, int sr,
+		    ktime_t *timeout, struct ext_wait_queue *ewp)
+	__releases(&info->lock)
+{
+	int retval;
+	signed long time;
+
+	wq_add(info, sr, ewp);
+
+	for (;;) {
+		__set_current_state(TASK_INTERRUPTIBLE);
+
+		spin_unlock(&info->lock);
+		time = schedule_hrtimeout_range_clock(timeout, 0,
+			HRTIMER_MODE_ABS, CLOCK_REALTIME);
+
+		if (ewp->state == STATE_READY) {
+			retval = 0;
+			goto out;
+		}
+		spin_lock(&info->lock);
+		if (ewp->state == STATE_READY) {
+			retval = 0;
+			goto out_unlock;
+		}
+		if (signal_pending(current)) {
+			retval = -ERESTARTSYS;
+			break;
+		}
+		if (time == 0) {
+			retval = -ETIMEDOUT;
+			break;
+		}
+	}
+	list_del(&ewp->list);
+out_unlock:
+	spin_unlock(&info->lock);
+out:
+	return retval;
+}
+
+/*
+ * Returns waiting task that should be serviced first or NULL if none exists
+ */
+static struct ext_wait_queue *wq_get_first_waiter(
+		struct mqueue_inode_info *info, int sr)
+{
+	struct list_head *ptr;
+
+	ptr = info->e_wait_q[sr].list.prev;
+	if (ptr == &info->e_wait_q[sr].list)
+		return NULL;
+	return list_entry(ptr, struct ext_wait_queue, list);
+}
+
+
+static inline void set_cookie(struct sk_buff *skb, char code)
+{
+	((char *)skb->data)[NOTIFY_COOKIE_LEN-1] = code;
+}
+
+/*
+ * The next function is only to split too long sys_mq_timedsend
+ */
+static void __do_notify(struct mqueue_inode_info *info)
+{
+	/* notification
+	 * invoked when there is registered process and there isn't process
+	 * waiting synchronously for message AND state of queue changed from
+	 * empty to not empty. Here we are sure that no one is waiting
+	 * synchronously. */
+	if (info->notify_owner &&
+	    info->attr.mq_curmsgs == 1) {
+		struct kernel_siginfo sig_i;
+		switch (info->notify.sigev_notify) {
+		case SIGEV_NONE:
+			break;
+		case SIGEV_SIGNAL:
+			/* sends signal */
+
+			clear_siginfo(&sig_i);
+			sig_i.si_signo = info->notify.sigev_signo;
+			sig_i.si_errno = 0;
+			sig_i.si_code = SI_MESGQ;
+			sig_i.si_value = info->notify.sigev_value;
+			/* map current pid/uid into info->owner's namespaces */
+			rcu_read_lock();
+			sig_i.si_pid = task_tgid_nr_ns(current,
+						ns_of_pid(info->notify_owner));
+			sig_i.si_uid = from_kuid_munged(info->notify_user_ns, current_uid());
+			rcu_read_unlock();
+
+			kill_pid_info(info->notify.sigev_signo,
+				      &sig_i, info->notify_owner);
+			break;
+		case SIGEV_THREAD:
+			set_cookie(info->notify_cookie, NOTIFY_WOKENUP);
+			netlink_sendskb(info->notify_sock, info->notify_cookie);
+			break;
+		}
+		/* after notification unregisters process */
+		put_pid(info->notify_owner);
+		put_user_ns(info->notify_user_ns);
+		info->notify_owner = NULL;
+		info->notify_user_ns = NULL;
+	}
+	wake_up(&info->wait_q);
+}
+
+static int prepare_timeout(const struct __kernel_timespec __user *u_abs_timeout,
+			   struct timespec64 *ts)
+{
+	if (get_timespec64(ts, u_abs_timeout))
+		return -EFAULT;
+	if (!timespec64_valid(ts))
+		return -EINVAL;
+	return 0;
+}
+
+static void remove_notification(struct mqueue_inode_info *info)
+{
+	if (info->notify_owner != NULL &&
+	    info->notify.sigev_notify == SIGEV_THREAD) {
+		set_cookie(info->notify_cookie, NOTIFY_REMOVED);
+		netlink_sendskb(info->notify_sock, info->notify_cookie);
+	}
+	put_pid(info->notify_owner);
+	put_user_ns(info->notify_user_ns);
+	info->notify_owner = NULL;
+	info->notify_user_ns = NULL;
+}
+
+static int prepare_open(struct dentry *dentry, int oflag, int ro,
+			umode_t mode, struct filename *name,
+			struct mq_attr *attr)
+{
+	static const int oflag2acc[O_ACCMODE] = { MAY_READ, MAY_WRITE,
+						  MAY_READ | MAY_WRITE };
+	int acc;
+
+	if (d_really_is_negative(dentry)) {
+		if (!(oflag & O_CREAT))
+			return -ENOENT;
+		if (ro)
+			return ro;
+		audit_inode_parent_hidden(name, dentry->d_parent);
+		return vfs_mkobj(dentry, mode & ~current_umask(),
+				  mqueue_create_attr, attr);
+	}
+	/* it already existed */
+	audit_inode(name, dentry, 0);
+	if ((oflag & (O_CREAT|O_EXCL)) == (O_CREAT|O_EXCL))
+		return -EEXIST;
+	if ((oflag & O_ACCMODE) == (O_RDWR | O_WRONLY))
+		return -EINVAL;
+	acc = oflag2acc[oflag & O_ACCMODE];
+	return inode_permission(d_inode(dentry), acc);
+}
+
+static int do_mq_open(const char __user *u_name, int oflag, umode_t mode,
+		      struct mq_attr *attr)
+{
+	struct vfsmount *mnt = current->nsproxy->ipc_ns->mq_mnt;
+	struct dentry *root = mnt->mnt_root;
+	struct filename *name;
+	struct path path;
+	int fd, error;
+	int ro;
+
+	audit_mq_open(oflag, mode, attr);
+
+	if (IS_ERR(name = getname(u_name)))
+		return PTR_ERR(name);
+
+	fd = get_unused_fd_flags(O_CLOEXEC);
+	if (fd < 0)
+		goto out_putname;
+
+	ro = mnt_want_write(mnt);	/* we'll drop it in any case */
+	inode_lock(d_inode(root));
+	path.dentry = lookup_one_len(name->name, root, strlen(name->name));
+	if (IS_ERR(path.dentry)) {
+		error = PTR_ERR(path.dentry);
+		goto out_putfd;
+	}
+	path.mnt = mntget(mnt);
+	error = prepare_open(path.dentry, oflag, ro, mode, name, attr);
+	if (!error) {
+		struct file *file = dentry_open(&path, oflag, current_cred());
+		if (!IS_ERR(file))
+			fd_install(fd, file);
+		else
+			error = PTR_ERR(file);
+	}
+	path_put(&path);
+out_putfd:
+	if (error) {
+		put_unused_fd(fd);
+		fd = error;
+	}
+	inode_unlock(d_inode(root));
+	if (!ro)
+		mnt_drop_write(mnt);
+out_putname:
+	putname(name);
+	return fd;
+}
+
+SYSCALL_DEFINE4(mq_open, const char __user *, u_name, int, oflag, umode_t, mode,
+		struct mq_attr __user *, u_attr)
+{
+	struct mq_attr attr;
+	if (u_attr && copy_from_user(&attr, u_attr, sizeof(struct mq_attr)))
+		return -EFAULT;
+
+	return do_mq_open(u_name, oflag, mode, u_attr ? &attr : NULL);
+}
+
+SYSCALL_DEFINE1(mq_unlink, const char __user *, u_name)
+{
+	int err;
+	struct filename *name;
+	struct dentry *dentry;
+	struct inode *inode = NULL;
+	struct ipc_namespace *ipc_ns = current->nsproxy->ipc_ns;
+	struct vfsmount *mnt = ipc_ns->mq_mnt;
+
+	name = getname(u_name);
+	if (IS_ERR(name))
+		return PTR_ERR(name);
+
+	audit_inode_parent_hidden(name, mnt->mnt_root);
+	err = mnt_want_write(mnt);
+	if (err)
+		goto out_name;
+	inode_lock_nested(d_inode(mnt->mnt_root), I_MUTEX_PARENT);
+	dentry = lookup_one_len(name->name, mnt->mnt_root,
+				strlen(name->name));
+	if (IS_ERR(dentry)) {
+		err = PTR_ERR(dentry);
+		goto out_unlock;
+	}
+
+	inode = d_inode(dentry);
+	if (!inode) {
+		err = -ENOENT;
+	} else {
+		ihold(inode);
+		err = vfs_unlink(d_inode(dentry->d_parent), dentry, NULL);
+	}
+	dput(dentry);
+
+out_unlock:
+	inode_unlock(d_inode(mnt->mnt_root));
+	if (inode)
+		iput(inode);
+	mnt_drop_write(mnt);
+out_name:
+	putname(name);
+
+	return err;
+}
+
+/* Pipelined send and receive functions.
+ *
+ * If a receiver finds no waiting message, then it registers itself in the
+ * list of waiting receivers. A sender checks that list before adding the new
+ * message into the message array. If there is a waiting receiver, then it
+ * bypasses the message array and directly hands the message over to the
+ * receiver. The receiver accepts the message and returns without grabbing the
+ * queue spinlock:
+ *
+ * - Set pointer to message.
+ * - Queue the receiver task for later wakeup (without the info->lock).
+ * - Update its state to STATE_READY. Now the receiver can continue.
+ * - Wake up the process after the lock is dropped. Should the process wake up
+ *   before this wakeup (due to a timeout or a signal) it will either see
+ *   STATE_READY and continue or acquire the lock to check the state again.
+ *
+ * The same algorithm is used for senders.
+ */
+
+/* pipelined_send() - send a message directly to the task waiting in
+ * sys_mq_timedreceive() (without inserting message into a queue).
+ */
+static inline void pipelined_send(struct wake_q_head *wake_q,
+				  struct mqueue_inode_info *info,
+				  struct msg_msg *message,
+				  struct ext_wait_queue *receiver)
+{
+	receiver->msg = message;
+	list_del(&receiver->list);
+	wake_q_add(wake_q, receiver->task);
+	/*
+	 * Rely on the implicit cmpxchg barrier from wake_q_add such
+	 * that we can ensure that updating receiver->state is the last
+	 * write operation: As once set, the receiver can continue,
+	 * and if we don't have the reference count from the wake_q,
+	 * yet, at that point we can later have a use-after-free
+	 * condition and bogus wakeup.
+	 */
+	receiver->state = STATE_READY;
+}
+
+/* pipelined_receive() - if there is task waiting in sys_mq_timedsend()
+ * gets its message and put to the queue (we have one free place for sure). */
+static inline void pipelined_receive(struct wake_q_head *wake_q,
+				     struct mqueue_inode_info *info)
+{
+	struct ext_wait_queue *sender = wq_get_first_waiter(info, SEND);
+
+	if (!sender) {
+		/* for poll */
+		wake_up_interruptible(&info->wait_q);
+		return;
+	}
+	if (msg_insert(sender->msg, info))
+		return;
+
+	list_del(&sender->list);
+	wake_q_add(wake_q, sender->task);
+	sender->state = STATE_READY;
+}
+
+static int do_mq_timedsend(mqd_t mqdes, const char __user *u_msg_ptr,
+		size_t msg_len, unsigned int msg_prio,
+		struct timespec64 *ts)
+{
+	struct fd f;
+	struct inode *inode;
+	struct ext_wait_queue wait;
+	struct ext_wait_queue *receiver;
+	struct msg_msg *msg_ptr;
+	struct mqueue_inode_info *info;
+	ktime_t expires, *timeout = NULL;
+	struct posix_msg_tree_node *new_leaf = NULL;
+	int ret = 0;
+	DEFINE_WAKE_Q(wake_q);
+
+	if (unlikely(msg_prio >= (unsigned long) MQ_PRIO_MAX))
+		return -EINVAL;
+
+	if (ts) {
+		expires = timespec64_to_ktime(*ts);
+		timeout = &expires;
+	}
+
+	audit_mq_sendrecv(mqdes, msg_len, msg_prio, ts);
+
+	f = fdget(mqdes);
+	if (unlikely(!f.file)) {
+		ret = -EBADF;
+		goto out;
+	}
+
+	inode = file_inode(f.file);
+	if (unlikely(f.file->f_op != &mqueue_file_operations)) {
+		ret = -EBADF;
+		goto out_fput;
+	}
+	info = MQUEUE_I(inode);
+	audit_file(f.file);
+
+	if (unlikely(!(f.file->f_mode & FMODE_WRITE))) {
+		ret = -EBADF;
+		goto out_fput;
+	}
+
+	if (unlikely(msg_len > info->attr.mq_msgsize)) {
+		ret = -EMSGSIZE;
+		goto out_fput;
+	}
+
+	/* First try to allocate memory, before doing anything with
+	 * existing queues. */
+	msg_ptr = load_msg(u_msg_ptr, msg_len);
+	if (IS_ERR(msg_ptr)) {
+		ret = PTR_ERR(msg_ptr);
+		goto out_fput;
+	}
+	msg_ptr->m_ts = msg_len;
+	msg_ptr->m_type = msg_prio;
+
+	/*
+	 * msg_insert really wants us to have a valid, spare node struct so
+	 * it doesn't have to kmalloc a GFP_ATOMIC allocation, but it will
+	 * fall back to that if necessary.
+	 */
+	if (!info->node_cache)
+		new_leaf = kmalloc(sizeof(*new_leaf), GFP_KERNEL);
+
+	spin_lock(&info->lock);
+
+	if (!info->node_cache && new_leaf) {
+		/* Save our speculative allocation into the cache */
+		INIT_LIST_HEAD(&new_leaf->msg_list);
+		info->node_cache = new_leaf;
+		new_leaf = NULL;
+	} else {
+		kfree(new_leaf);
+	}
+
+	if (info->attr.mq_curmsgs == info->attr.mq_maxmsg) {
+		if (f.file->f_flags & O_NONBLOCK) {
+			ret = -EAGAIN;
+		} else {
+			wait.task = current;
+			wait.msg = (void *) msg_ptr;
+			wait.state = STATE_NONE;
+			ret = wq_sleep(info, SEND, timeout, &wait);
+			/*
+			 * wq_sleep must be called with info->lock held, and
+			 * returns with the lock released
+			 */
+			goto out_free;
+		}
+	} else {
+		receiver = wq_get_first_waiter(info, RECV);
+		if (receiver) {
+			pipelined_send(&wake_q, info, msg_ptr, receiver);
+		} else {
+			/* adds message to the queue */
+			ret = msg_insert(msg_ptr, info);
+			if (ret)
+				goto out_unlock;
+			__do_notify(info);
+		}
+		inode->i_atime = inode->i_mtime = inode->i_ctime =
+				current_time(inode);
+	}
+out_unlock:
+	spin_unlock(&info->lock);
+	wake_up_q(&wake_q);
+out_free:
+	if (ret)
+		free_msg(msg_ptr);
+out_fput:
+	fdput(f);
+out:
+	return ret;
+}
+
+static int do_mq_timedreceive(mqd_t mqdes, char __user *u_msg_ptr,
+		size_t msg_len, unsigned int __user *u_msg_prio,
+		struct timespec64 *ts)
+{
+	ssize_t ret;
+	struct msg_msg *msg_ptr;
+	struct fd f;
+	struct inode *inode;
+	struct mqueue_inode_info *info;
+	struct ext_wait_queue wait;
+	ktime_t expires, *timeout = NULL;
+	struct posix_msg_tree_node *new_leaf = NULL;
+
+	if (ts) {
+		expires = timespec64_to_ktime(*ts);
+		timeout = &expires;
+	}
+
+	audit_mq_sendrecv(mqdes, msg_len, 0, ts);
+
+	f = fdget(mqdes);
+	if (unlikely(!f.file)) {
+		ret = -EBADF;
+		goto out;
+	}
+
+	inode = file_inode(f.file);
+	if (unlikely(f.file->f_op != &mqueue_file_operations)) {
+		ret = -EBADF;
+		goto out_fput;
+	}
+	info = MQUEUE_I(inode);
+	audit_file(f.file);
+
+	if (unlikely(!(f.file->f_mode & FMODE_READ))) {
+		ret = -EBADF;
+		goto out_fput;
+	}
+
+	/* checks if buffer is big enough */
+	if (unlikely(msg_len < info->attr.mq_msgsize)) {
+		ret = -EMSGSIZE;
+		goto out_fput;
+	}
+
+	/*
+	 * msg_insert really wants us to have a valid, spare node struct so
+	 * it doesn't have to kmalloc a GFP_ATOMIC allocation, but it will
+	 * fall back to that if necessary.
+	 */
+	if (!info->node_cache)
+		new_leaf = kmalloc(sizeof(*new_leaf), GFP_KERNEL);
+
+	spin_lock(&info->lock);
+
+	if (!info->node_cache && new_leaf) {
+		/* Save our speculative allocation into the cache */
+		INIT_LIST_HEAD(&new_leaf->msg_list);
+		info->node_cache = new_leaf;
+	} else {
+		kfree(new_leaf);
+	}
+
+	if (info->attr.mq_curmsgs == 0) {
+		if (f.file->f_flags & O_NONBLOCK) {
+			spin_unlock(&info->lock);
+			ret = -EAGAIN;
+		} else {
+			wait.task = current;
+			wait.state = STATE_NONE;
+			ret = wq_sleep(info, RECV, timeout, &wait);
+			msg_ptr = wait.msg;
+		}
+	} else {
+		DEFINE_WAKE_Q(wake_q);
+
+		msg_ptr = msg_get(info);
+
+		inode->i_atime = inode->i_mtime = inode->i_ctime =
+				current_time(inode);
+
+		/* There is now free space in queue. */
+		pipelined_receive(&wake_q, info);
+		spin_unlock(&info->lock);
+		wake_up_q(&wake_q);
+		ret = 0;
+	}
+	if (ret == 0) {
+		ret = msg_ptr->m_ts;
+
+		if ((u_msg_prio && put_user(msg_ptr->m_type, u_msg_prio)) ||
+			store_msg(u_msg_ptr, msg_ptr, msg_ptr->m_ts)) {
+			ret = -EFAULT;
+		}
+		free_msg(msg_ptr);
+	}
+out_fput:
+	fdput(f);
+out:
+	return ret;
+}
+
+SYSCALL_DEFINE5(mq_timedsend, mqd_t, mqdes, const char __user *, u_msg_ptr,
+		size_t, msg_len, unsigned int, msg_prio,
+		const struct __kernel_timespec __user *, u_abs_timeout)
+{
+	struct timespec64 ts, *p = NULL;
+	if (u_abs_timeout) {
+		int res = prepare_timeout(u_abs_timeout, &ts);
+		if (res)
+			return res;
+		p = &ts;
+	}
+	return do_mq_timedsend(mqdes, u_msg_ptr, msg_len, msg_prio, p);
+}
+
+SYSCALL_DEFINE5(mq_timedreceive, mqd_t, mqdes, char __user *, u_msg_ptr,
+		size_t, msg_len, unsigned int __user *, u_msg_prio,
+		const struct __kernel_timespec __user *, u_abs_timeout)
+{
+	struct timespec64 ts, *p = NULL;
+	if (u_abs_timeout) {
+		int res = prepare_timeout(u_abs_timeout, &ts);
+		if (res)
+			return res;
+		p = &ts;
+	}
+	return do_mq_timedreceive(mqdes, u_msg_ptr, msg_len, u_msg_prio, p);
+}
+
+/*
+ * Notes: the case when user wants us to deregister (with NULL as pointer)
+ * and he isn't currently owner of notification, will be silently discarded.
+ * It isn't explicitly defined in the POSIX.
+ */
+static int do_mq_notify(mqd_t mqdes, const struct sigevent *notification)
+{
+	int ret;
+	struct fd f;
+	struct sock *sock;
+	struct inode *inode;
+	struct mqueue_inode_info *info;
+	struct sk_buff *nc;
+
+	audit_mq_notify(mqdes, notification);
+
+	nc = NULL;
+	sock = NULL;
+	if (notification != NULL) {
+		if (unlikely(notification->sigev_notify != SIGEV_NONE &&
+			     notification->sigev_notify != SIGEV_SIGNAL &&
+			     notification->sigev_notify != SIGEV_THREAD))
+			return -EINVAL;
+		if (notification->sigev_notify == SIGEV_SIGNAL &&
+			!valid_signal(notification->sigev_signo)) {
+			return -EINVAL;
+		}
+		if (notification->sigev_notify == SIGEV_THREAD) {
+			long timeo;
+
+			/* create the notify skb */
+			nc = alloc_skb(NOTIFY_COOKIE_LEN, GFP_KERNEL);
+			if (!nc) {
+				ret = -ENOMEM;
+				goto out;
+			}
+			if (copy_from_user(nc->data,
+					notification->sigev_value.sival_ptr,
+					NOTIFY_COOKIE_LEN)) {
+				ret = -EFAULT;
+				goto out;
+			}
+
+			/* TODO: add a header? */
+			skb_put(nc, NOTIFY_COOKIE_LEN);
+			/* and attach it to the socket */
+retry:
+			f = fdget(notification->sigev_signo);
+			if (!f.file) {
+				ret = -EBADF;
+				goto out;
+			}
+			sock = netlink_getsockbyfilp(f.file);
+			fdput(f);
+			if (IS_ERR(sock)) {
+				ret = PTR_ERR(sock);
+				sock = NULL;
+				goto out;
+			}
+
+			timeo = MAX_SCHEDULE_TIMEOUT;
+			ret = netlink_attachskb(sock, nc, &timeo, NULL);
+			if (ret == 1) {
+				sock = NULL;
+				goto retry;
+			}
+			if (ret) {
+				sock = NULL;
+				nc = NULL;
+				goto out;
+			}
+		}
+	}
+
+	f = fdget(mqdes);
+	if (!f.file) {
+		ret = -EBADF;
+		goto out;
+	}
+
+	inode = file_inode(f.file);
+	if (unlikely(f.file->f_op != &mqueue_file_operations)) {
+		ret = -EBADF;
+		goto out_fput;
+	}
+	info = MQUEUE_I(inode);
+
+	ret = 0;
+	spin_lock(&info->lock);
+	if (notification == NULL) {
+		if (info->notify_owner == task_tgid(current)) {
+			remove_notification(info);
+			inode->i_atime = inode->i_ctime = current_time(inode);
+		}
+	} else if (info->notify_owner != NULL) {
+		ret = -EBUSY;
+	} else {
+		switch (notification->sigev_notify) {
+		case SIGEV_NONE:
+			info->notify.sigev_notify = SIGEV_NONE;
+			break;
+		case SIGEV_THREAD:
+			info->notify_sock = sock;
+			info->notify_cookie = nc;
+			sock = NULL;
+			nc = NULL;
+			info->notify.sigev_notify = SIGEV_THREAD;
+			break;
+		case SIGEV_SIGNAL:
+			info->notify.sigev_signo = notification->sigev_signo;
+			info->notify.sigev_value = notification->sigev_value;
+			info->notify.sigev_notify = SIGEV_SIGNAL;
+			break;
+		}
+
+		info->notify_owner = get_pid(task_tgid(current));
+		info->notify_user_ns = get_user_ns(current_user_ns());
+		inode->i_atime = inode->i_ctime = current_time(inode);
+	}
+	spin_unlock(&info->lock);
+out_fput:
+	fdput(f);
+out:
+	if (sock)
+		netlink_detachskb(sock, nc);
+	else if (nc)
+		dev_kfree_skb(nc);
+
+	return ret;
+}
+
+SYSCALL_DEFINE2(mq_notify, mqd_t, mqdes,
+		const struct sigevent __user *, u_notification)
+{
+	struct sigevent n, *p = NULL;
+	if (u_notification) {
+		if (copy_from_user(&n, u_notification, sizeof(struct sigevent)))
+			return -EFAULT;
+		p = &n;
+	}
+	return do_mq_notify(mqdes, p);
+}
+
+static int do_mq_getsetattr(int mqdes, struct mq_attr *new, struct mq_attr *old)
+{
+	struct fd f;
+	struct inode *inode;
+	struct mqueue_inode_info *info;
+
+	if (new && (new->mq_flags & (~O_NONBLOCK)))
+		return -EINVAL;
+
+	f = fdget(mqdes);
+	if (!f.file)
+		return -EBADF;
+
+	if (unlikely(f.file->f_op != &mqueue_file_operations)) {
+		fdput(f);
+		return -EBADF;
+	}
+
+	inode = file_inode(f.file);
+	info = MQUEUE_I(inode);
+
+	spin_lock(&info->lock);
+
+	if (old) {
+		*old = info->attr;
+		old->mq_flags = f.file->f_flags & O_NONBLOCK;
+	}
+	if (new) {
+		audit_mq_getsetattr(mqdes, new);
+		spin_lock(&f.file->f_lock);
+		if (new->mq_flags & O_NONBLOCK)
+			f.file->f_flags |= O_NONBLOCK;
+		else
+			f.file->f_flags &= ~O_NONBLOCK;
+		spin_unlock(&f.file->f_lock);
+
+		inode->i_atime = inode->i_ctime = current_time(inode);
+	}
+
+	spin_unlock(&info->lock);
+	fdput(f);
+	return 0;
+}
+
+SYSCALL_DEFINE3(mq_getsetattr, mqd_t, mqdes,
+		const struct mq_attr __user *, u_mqstat,
+		struct mq_attr __user *, u_omqstat)
+{
+	int ret;
+	struct mq_attr mqstat, omqstat;
+	struct mq_attr *new = NULL, *old = NULL;
+
+	if (u_mqstat) {
+		new = &mqstat;
+		if (copy_from_user(new, u_mqstat, sizeof(struct mq_attr)))
+			return -EFAULT;
+	}
+	if (u_omqstat)
+		old = &omqstat;
+
+	ret = do_mq_getsetattr(mqdes, new, old);
+	if (ret || !old)
+		return ret;
+
+	if (copy_to_user(u_omqstat, old, sizeof(struct mq_attr)))
+		return -EFAULT;
+	return 0;
+}
+
+#ifdef CONFIG_COMPAT
+
+struct compat_mq_attr {
+	compat_long_t mq_flags;      /* message queue flags		     */
+	compat_long_t mq_maxmsg;     /* maximum number of messages	     */
+	compat_long_t mq_msgsize;    /* maximum message size		     */
+	compat_long_t mq_curmsgs;    /* number of messages currently queued  */
+	compat_long_t __reserved[4]; /* ignored for input, zeroed for output */
+};
+
+static inline int get_compat_mq_attr(struct mq_attr *attr,
+			const struct compat_mq_attr __user *uattr)
+{
+	struct compat_mq_attr v;
+
+	if (copy_from_user(&v, uattr, sizeof(*uattr)))
+		return -EFAULT;
+
+	memset(attr, 0, sizeof(*attr));
+	attr->mq_flags = v.mq_flags;
+	attr->mq_maxmsg = v.mq_maxmsg;
+	attr->mq_msgsize = v.mq_msgsize;
+	attr->mq_curmsgs = v.mq_curmsgs;
+	return 0;
+}
+
+static inline int put_compat_mq_attr(const struct mq_attr *attr,
+			struct compat_mq_attr __user *uattr)
+{
+	struct compat_mq_attr v;
+
+	memset(&v, 0, sizeof(v));
+	v.mq_flags = attr->mq_flags;
+	v.mq_maxmsg = attr->mq_maxmsg;
+	v.mq_msgsize = attr->mq_msgsize;
+	v.mq_curmsgs = attr->mq_curmsgs;
+	if (copy_to_user(uattr, &v, sizeof(*uattr)))
+		return -EFAULT;
+	return 0;
+}
+
+COMPAT_SYSCALL_DEFINE4(mq_open, const char __user *, u_name,
+		       int, oflag, compat_mode_t, mode,
+		       struct compat_mq_attr __user *, u_attr)
+{
+	struct mq_attr attr, *p = NULL;
+	if (u_attr && oflag & O_CREAT) {
+		p = &attr;
+		if (get_compat_mq_attr(&attr, u_attr))
+			return -EFAULT;
+	}
+	return do_mq_open(u_name, oflag, mode, p);
+}
+
+COMPAT_SYSCALL_DEFINE2(mq_notify, mqd_t, mqdes,
+		       const struct compat_sigevent __user *, u_notification)
+{
+	struct sigevent n, *p = NULL;
+	if (u_notification) {
+		if (get_compat_sigevent(&n, u_notification))
+			return -EFAULT;
+		if (n.sigev_notify == SIGEV_THREAD)
+			n.sigev_value.sival_ptr = compat_ptr(n.sigev_value.sival_int);
+		p = &n;
+	}
+	return do_mq_notify(mqdes, p);
+}
+
+COMPAT_SYSCALL_DEFINE3(mq_getsetattr, mqd_t, mqdes,
+		       const struct compat_mq_attr __user *, u_mqstat,
+		       struct compat_mq_attr __user *, u_omqstat)
+{
+	int ret;
+	struct mq_attr mqstat, omqstat;
+	struct mq_attr *new = NULL, *old = NULL;
+
+	if (u_mqstat) {
+		new = &mqstat;
+		if (get_compat_mq_attr(new, u_mqstat))
+			return -EFAULT;
+	}
+	if (u_omqstat)
+		old = &omqstat;
+
+	ret = do_mq_getsetattr(mqdes, new, old);
+	if (ret || !old)
+		return ret;
+
+	if (put_compat_mq_attr(old, u_omqstat))
+		return -EFAULT;
+	return 0;
+}
+#endif
+
+#ifdef CONFIG_COMPAT_32BIT_TIME
+static int compat_prepare_timeout(const struct old_timespec32 __user *p,
+				   struct timespec64 *ts)
+{
+	if (get_old_timespec32(ts, p))
+		return -EFAULT;
+	if (!timespec64_valid(ts))
+		return -EINVAL;
+	return 0;
+}
+
+SYSCALL_DEFINE5(mq_timedsend_time32, mqd_t, mqdes,
+		const char __user *, u_msg_ptr,
+		unsigned int, msg_len, unsigned int, msg_prio,
+		const struct old_timespec32 __user *, u_abs_timeout)
+{
+	struct timespec64 ts, *p = NULL;
+	if (u_abs_timeout) {
+		int res = compat_prepare_timeout(u_abs_timeout, &ts);
+		if (res)
+			return res;
+		p = &ts;
+	}
+	return do_mq_timedsend(mqdes, u_msg_ptr, msg_len, msg_prio, p);
+}
+
+SYSCALL_DEFINE5(mq_timedreceive_time32, mqd_t, mqdes,
+		char __user *, u_msg_ptr,
+		unsigned int, msg_len, unsigned int __user *, u_msg_prio,
+		const struct old_timespec32 __user *, u_abs_timeout)
+{
+	struct timespec64 ts, *p = NULL;
+	if (u_abs_timeout) {
+		int res = compat_prepare_timeout(u_abs_timeout, &ts);
+		if (res)
+			return res;
+		p = &ts;
+	}
+	return do_mq_timedreceive(mqdes, u_msg_ptr, msg_len, u_msg_prio, p);
+}
+#endif
+
+static const struct inode_operations mqueue_dir_inode_operations = {
+	.lookup = simple_lookup,
+	.create = mqueue_create,
+	.unlink = mqueue_unlink,
+};
+
+static const struct file_operations mqueue_file_operations = {
+	.flush = mqueue_flush_file,
+	.poll = mqueue_poll_file,
+	.read = mqueue_read_file,
+	.llseek = default_llseek,
+};
+
+static const struct super_operations mqueue_super_ops = {
+	.alloc_inode = mqueue_alloc_inode,
+	.destroy_inode = mqueue_destroy_inode,
+	.evict_inode = mqueue_evict_inode,
+	.statfs = simple_statfs,
+};
+
+static struct file_system_type mqueue_fs_type = {
+	.name = "mqueue",
+	.mount = mqueue_mount,
+	.kill_sb = kill_litter_super,
+	.fs_flags = FS_USERNS_MOUNT,
+};
+
+int mq_init_ns(struct ipc_namespace *ns)
+{
+	ns->mq_queues_count  = 0;
+	ns->mq_queues_max    = DFLT_QUEUESMAX;
+	ns->mq_msg_max       = DFLT_MSGMAX;
+	ns->mq_msgsize_max   = DFLT_MSGSIZEMAX;
+	ns->mq_msg_default   = DFLT_MSG;
+	ns->mq_msgsize_default  = DFLT_MSGSIZE;
+
+	ns->mq_mnt = kern_mount_data(&mqueue_fs_type, ns);
+	if (IS_ERR(ns->mq_mnt)) {
+		int err = PTR_ERR(ns->mq_mnt);
+		ns->mq_mnt = NULL;
+		return err;
+	}
+	return 0;
+}
+
+void mq_clear_sbinfo(struct ipc_namespace *ns)
+{
+	ns->mq_mnt->mnt_sb->s_fs_info = NULL;
+}
+
+void mq_put_mnt(struct ipc_namespace *ns)
+{
+	kern_unmount(ns->mq_mnt);
+}
+
+static int __init init_mqueue_fs(void)
+{
+	int error;
+
+	mqueue_inode_cachep = kmem_cache_create("mqueue_inode_cache",
+				sizeof(struct mqueue_inode_info), 0,
+				SLAB_HWCACHE_ALIGN|SLAB_ACCOUNT, init_once);
+	if (mqueue_inode_cachep == NULL)
+		return -ENOMEM;
+
+	/* ignore failures - they are not fatal */
+	mq_sysctl_table = mq_register_sysctl_table();
+
+	error = register_filesystem(&mqueue_fs_type);
+	if (error)
+		goto out_sysctl;
+
+	spin_lock_init(&mq_lock);
+
+	error = mq_init_ns(&init_ipc_ns);
+	if (error)
+		goto out_filesystem;
+
+	return 0;
+
+out_filesystem:
+	unregister_filesystem(&mqueue_fs_type);
+out_sysctl:
+	if (mq_sysctl_table)
+		unregister_sysctl_table(mq_sysctl_table);
+	kmem_cache_destroy(mqueue_inode_cachep);
+	return error;
+}
+
+device_initcall(init_mqueue_fs);
+
+/*
+ * This code is in the public domain, but in Linux it's simplest to just
+ * say it's GPL and consider the authors as the copyright holders.
+ */
+MODULE_LICENSE("GPL");
+
+/*
+ * Range decoder initialization eats the first five bytes of each LZMA chunk.
+ */
+#define RC_INIT_BYTES 5
+
+/*
+ * Minimum number of usable input buffer to safely decode one LZMA symbol.
+ * The worst case is that we decode 22 bits using probabilities and 26
+ * direct bits. This may decode at maximum of 20 bytes of input. However,
+ * lzma_main() does an extra normalization before returning, thus we
+ * need to put 21 here.
+ */
+#define LZMA_IN_REQUIRED 21
+
+/*
+ * Dictionary (history buffer)
+ *
+ * These are always true:
+ *    start <= pos <= full <= end
+ *    pos <= limit <= end
+ *
+ * In multi-call mode, also these are true:
+ *    end == size
+ *    size <= size_max
+ *    allocated <= size
+ *
+ * Most of these variables are size_t to support single-call mode,
+ * in which the dictionary variables address the actual output
+ * buffer directly.
+ */
+struct dictionary {
+	/* Beginning of the history buffer */
+	uint8_t *buf;
+
+	/* Old position in buf (before decoding more data) */
+	size_t start;
+
+	/* Position in buf */
+	size_t pos;
+
+	/*
+	 * How full dictionary is. This is used to detect corrupt input that
+	 * would read beyond the beginning of the uncompressed stream.
+	 */
+	size_t full;
+
+	/* Write limit; we don't write to buf[limit] or later bytes. */
+	size_t limit;
+
+	/*
+	 * End of the dictionary buffer. In multi-call mode, this is
+	 * the same as the dictionary size. In single-call mode, this
+	 * indicates the size of the output buffer.
+	 */
+	size_t end;
+
+	/*
+	 * Size of the dictionary as specified in Block Header. This is used
+	 * together with "full" to detect corrupt input that would make us
+	 * read beyond the beginning of the uncompressed stream.
+	 */
+	uint32_t size;
+
+	/*
+	 * Maximum allowed dictionary size in multi-call mode.
+	 * This is ignored in single-call mode.
+	 */
+	uint32_t size_max;
+
+	/*
+	 * Amount of memory currently allocated for the dictionary.
+	 * This is used only with XZ_DYNALLOC. (With XZ_PREALLOC,
+	 * size_max is always the same as the allocated size.)
+	 */
+	uint32_t allocated;
+
+	/* Operation mode */
+	enum xz_mode mode;
+};
+
+/* Range decoder */
+struct rc_dec {
+	uint32_t range;
+	uint32_t code;
+
+	/*
+	 * Number of initializing bytes remaining to be read
+	 * by rc_read_init().
+	 */
+	uint32_t init_bytes_left;
+
+	/*
+	 * Buffer from which we read our input. It can be either
+	 * temp.buf or the caller-provided input buffer.
+	 */
+	const uint8_t *in;
+	size_t in_pos;
+	size_t in_limit;
+};
+
+/* Probabilities for a length decoder. */
+struct lzma_len_dec {
+	/* Probability of match length being at least 10 */
+	uint16_t choice;
+
+	/* Probability of match length being at least 18 */
+	uint16_t choice2;
+
+	/* Probabilities for match lengths 2-9 */
+	uint16_t low[POS_STATES_MAX][LEN_LOW_SYMBOLS];
+
+	/* Probabilities for match lengths 10-17 */
+	uint16_t mid[POS_STATES_MAX][LEN_MID_SYMBOLS];
+
+	/* Probabilities for match lengths 18-273 */
+	uint16_t high[LEN_HIGH_SYMBOLS];
+};
+
+struct lzma_dec {
+	/* Distances of latest four matches */
+	uint32_t rep0;
+	uint32_t rep1;
+	uint32_t rep2;
+	uint32_t rep3;
+
+	/* Types of the most recently seen LZMA symbols */
+	enum lzma_state state;
+
+	/*
+	 * Length of a match. This is updated so that dict_repeat can
+	 * be called again to finish repeating the whole match.
+	 */
+	uint32_t len;
+
+	/*
+	 * LZMA properties or related bit masks (number of literal
+	 * context bits, a mask dervied from the number of literal
+	 * position bits, and a mask dervied from the number
+	 * position bits)
+	 */
+	uint32_t lc;
+	uint32_t literal_pos_mask; /* (1 << lp) - 1 */
+	uint32_t pos_mask;         /* (1 << pb) - 1 */
+
+	/* If 1, it's a match. Otherwise it's a single 8-bit literal. */
+	uint16_t is_match[STATES][POS_STATES_MAX];
+
+	/* If 1, it's a repeated match. The distance is one of rep0 .. rep3. */
+	uint16_t is_rep[STATES];
+
+	/*
+	 * If 0, distance of a repeated match is rep0.
+	 * Otherwise check is_rep1.
+	 */
+	uint16_t is_rep0[STATES];
+
+	/*
+	 * If 0, distance of a repeated match is rep1.
+	 * Otherwise check is_rep2.
+	 */
+	uint16_t is_rep1[STATES];
+
+	/* If 0, distance of a repeated match is rep2. Otherwise it is rep3. */
+	uint16_t is_rep2[STATES];
+
+	/*
+	 * If 1, the repeated match has length of one byte. Otherwise
+	 * the length is decoded from rep_len_decoder.
+	 */
+	uint16_t is_rep0_long[STATES][POS_STATES_MAX];
+
+	/*
+	 * Probability tree for the highest two bits of the match
+	 * distance. There is a separate probability tree for match
+	 * lengths of 2 (i.e. MATCH_LEN_MIN), 3, 4, and [5, 273].
+	 */
+	uint16_t dist_slot[DIST_STATES][DIST_SLOTS];
+
+	/*
+	 * Probility trees for additional bits for match distance
+	 * when the distance is in the range [4, 127].
+	 */
+	uint16_t dist_special[FULL_DISTANCES - DIST_MODEL_END];
+
+	/*
+	 * Probability tree for the lowest four bits of a match
+	 * distance that is equal to or greater than 128.
+	 */
+	uint16_t dist_align[ALIGN_SIZE];
+
+	/* Length of a normal match */
+	struct lzma_len_dec match_len_dec;
+
+	/* Length of a repeated match */
+	struct lzma_len_dec rep_len_dec;
+
+	/* Probabilities of literals */
+	uint16_t literal[LITERAL_CODERS_MAX][LITERAL_CODER_SIZE];
+};
+
+struct lzma2_dec {
+	/* Position in xz_dec_lzma2_run(). */
+	enum lzma2_seq {
+		SEQ_CONTROL,
+		SEQ_UNCOMPRESSED_1,
+		SEQ_UNCOMPRESSED_2,
+		SEQ_COMPRESSED_0,
+		SEQ_COMPRESSED_1,
+		SEQ_PROPERTIES,
+		SEQ_LZMA_PREPARE,
+		SEQ_LZMA_RUN,
+		SEQ_COPY
+	} sequence;
+
+	/* Next position after decoding the compressed size of the chunk. */
+	enum lzma2_seq next_sequence;
+
+	/* Uncompressed size of LZMA chunk (2 MiB at maximum) */
+	uint32_t uncompressed;
+
+	/*
+	 * Compressed size of LZMA chunk or compressed/uncompressed
+	 * size of uncompressed chunk (64 KiB at maximum)
+	 */
+	uint32_t compressed;
+
+	/*
+	 * True if dictionary reset is needed. This is false before
+	 * the first chunk (LZMA or uncompressed).
+	 */
+	bool need_dict_reset;
+
+	/*
+	 * True if new LZMA properties are needed. This is false
+	 * before the first LZMA chunk.
+	 */
+	bool need_props;
+};
+
+struct xz_dec_lzma2 {
+	/*
+	 * The order below is important on x86 to reduce code size and
+	 * it shouldn't hurt on other platforms. Everything up to and
+	 * including lzma.pos_mask are in the first 128 bytes on x86-32,
+	 * which allows using smaller instructions to access those
+	 * variables. On x86-64, fewer variables fit into the first 128
+	 * bytes, but this is still the best order without sacrificing
+	 * the readability by splitting the structures.
+	 */
+	struct rc_dec rc;
+	struct dictionary dict;
+	struct lzma2_dec lzma2;
+	struct lzma_dec lzma;
+
+	/*
+	 * Temporary buffer which holds small number of input bytes between
+	 * decoder calls. See lzma2_lzma() for details.
+	 */
+	struct {
+		uint32_t size;
+		uint8_t buf[3 * LZMA_IN_REQUIRED];
+	} temp;
+};
+
+/**************
+ * Dictionary *
+ **************/
+
+/*
+ * Reset the dictionary state. When in single-call mode, set up the beginning
+ * of the dictionary to point to the actual output buffer.
+ */
+static void dict_reset(struct dictionary *dict, struct xz_buf *b)
+{
+	if (DEC_IS_SINGLE(dict->mode)) {
+		dict->buf = b->out + b->out_pos;
+		dict->end = b->out_size - b->out_pos;
+	}
+
+	dict->start = 0;
+	dict->pos = 0;
+	dict->limit = 0;
+	dict->full = 0;
+}
+
+/* Set dictionary write limit */
+static void dict_limit(struct dictionary *dict, size_t out_max)
+{
+	if (dict->end - dict->pos <= out_max)
+		dict->limit = dict->end;
+	else
+		dict->limit = dict->pos + out_max;
+}
+
+/* Return true if at least one byte can be written into the dictionary. */
+static inline bool dict_has_space(const struct dictionary *dict)
+{
+	return dict->pos < dict->limit;
+}
+
+/*
+ * Get a byte from the dictionary at the given distance. The distance is
+ * assumed to valid, or as a special case, zero when the dictionary is
+ * still empty. This special case is needed for single-call decoding to
+ * avoid writing a '\0' to the end of the destination buffer.
+ */
+static inline uint32_t dict_get(const struct dictionary *dict, uint32_t dist)
+{
+	size_t offset = dict->pos - dist - 1;
+
+	if (dist >= dict->pos)
+		offset += dict->end;
+
+	return dict->full > 0 ? dict->buf[offset] : 0;
+}
+
+/*
+ * Put one byte into the dictionary. It is assumed that there is space for it.
+ */
+static inline void dict_put(struct dictionary *dict, uint8_t byte)
+{
+	dict->buf[dict->pos++] = byte;
+
+	if (dict->full < dict->pos)
+		dict->full = dict->pos;
+}
+
+/*
+ * Repeat given number of bytes from the given distance. If the distance is
+ * invalid, false is returned. On success, true is returned and *len is
+ * updated to indicate how many bytes were left to be repeated.
+ */
+static bool dict_repeat(struct dictionary *dict, uint32_t *len, uint32_t dist)
+{
+	size_t back;
+	uint32_t left;
+
+	if (dist >= dict->full || dist >= dict->size)
+		return false;
+
+	left = min_t(size_t, dict->limit - dict->pos, *len);
+	*len -= left;
+
+	back = dict->pos - dist - 1;
+	if (dist >= dict->pos)
+		back += dict->end;
+
+	do {
+		dict->buf[dict->pos++] = dict->buf[back++];
+		if (back == dict->end)
+			back = 0;
+	} while (--left > 0);
+
+	if (dict->full < dict->pos)
+		dict->full = dict->pos;
+
+	return true;
+}
+
+/* Copy uncompressed data as is from input to dictionary and output buffers. */
+static void dict_uncompressed(struct dictionary *dict, struct xz_buf *b,
+			      uint32_t *left)
+{
+	size_t copy_size;
+
+	while (*left > 0 && b->in_pos < b->in_size
+			&& b->out_pos < b->out_size) {
+		copy_size = min(b->in_size - b->in_pos,
+				b->out_size - b->out_pos);
+		if (copy_size > dict->end - dict->pos)
+			copy_size = dict->end - dict->pos;
+		if (copy_size > *left)
+			copy_size = *left;
+
+		*left -= copy_size;
+
+		memcpy(dict->buf + dict->pos, b->in + b->in_pos, copy_size);
+		dict->pos += copy_size;
+
+		if (dict->full < dict->pos)
+			dict->full = dict->pos;
+
+		if (DEC_IS_MULTI(dict->mode)) {
+			if (dict->pos == dict->end)
+				dict->pos = 0;
+
+			memcpy(b->out + b->out_pos, b->in + b->in_pos,
+					copy_size);
+		}
+
+		dict->start = dict->pos;
+
+		b->out_pos += copy_size;
+		b->in_pos += copy_size;
+	}
+}
+
+/*
+ * Flush pending data from dictionary to b->out. It is assumed that there is
+ * enough space in b->out. This is guaranteed because caller uses dict_limit()
+ * before decoding data into the dictionary.
+ */
+static uint32_t dict_flush(struct dictionary *dict, struct xz_buf *b)
+{
+	size_t copy_size = dict->pos - dict->start;
+
+	if (DEC_IS_MULTI(dict->mode)) {
+		if (dict->pos == dict->end)
+			dict->pos = 0;
+
+		memcpy(b->out + b->out_pos, dict->buf + dict->start,
+				copy_size);
+	}
+
+	dict->start = dict->pos;
+	b->out_pos += copy_size;
+	return copy_size;
+}
+
+/*****************
+ * Range decoder *
+ *****************/
+
+/* Reset the range decoder. */
+static void rc_reset(struct rc_dec *rc)
+{
+	rc->range = (uint32_t)-1;
+	rc->code = 0;
+	rc->init_bytes_left = RC_INIT_BYTES;
+}
+
+/*
+ * Read the first five initial bytes into rc->code if they haven't been
+ * read already. (Yes, the first byte gets completely ignored.)
+ */
+static bool rc_read_init(struct rc_dec *rc, struct xz_buf *b)
+{
+	while (rc->init_bytes_left > 0) {
+		if (b->in_pos == b->in_size)
+			return false;
+
+		rc->code = (rc->code << 8) + b->in[b->in_pos++];
+		--rc->init_bytes_left;
+	}
+
+	return true;
+}
+
+/* Return true if there may not be enough input for the next decoding loop. */
+static inline bool rc_limit_exceeded(const struct rc_dec *rc)
+{
+	return rc->in_pos > rc->in_limit;
+}
+
+/*
+ * Return true if it is possible (from point of view of range decoder) that
+ * we have reached the end of the LZMA chunk.
+ */
+static inline bool rc_is_finished(const struct rc_dec *rc)
+{
+	return rc->code == 0;
+}
+
+/* Read the next input byte if needed. */
+static __always_inline void rc_normalize(struct rc_dec *rc)
+{
+	if (rc->range < RC_TOP_VALUE) {
+		rc->range <<= RC_SHIFT_BITS;
+		rc->code = (rc->code << RC_SHIFT_BITS) + rc->in[rc->in_pos++];
+	}
+}
+
+/*
+ * Decode one bit. In some versions, this function has been splitted in three
+ * functions so that the compiler is supposed to be able to more easily avoid
+ * an extra branch. In this particular version of the LZMA decoder, this
+ * doesn't seem to be a good idea (tested with GCC 3.3.6, 3.4.6, and 4.3.3
+ * on x86). Using a non-splitted version results in nicer looking code too.
+ *
+ * NOTE: This must return an int. Do not make it return a bool or the speed
+ * of the code generated by GCC 3.x decreases 10-15 %. (GCC 4.3 doesn't care,
+ * and it generates 10-20 % faster code than GCC 3.x from this file anyway.)
+ */
+static __always_inline int rc_bit(struct rc_dec *rc, uint16_t *prob)
+{
+	uint32_t bound;
+	int bit;
+
+	rc_normalize(rc);
+	bound = (rc->range >> RC_BIT_MODEL_TOTAL_BITS) * *prob;
+	if (rc->code < bound) {
+		rc->range = bound;
+		*prob += (RC_BIT_MODEL_TOTAL - *prob) >> RC_MOVE_BITS;
+		bit = 0;
+	} else {
+		rc->range -= bound;
+		rc->code -= bound;
+		*prob -= *prob >> RC_MOVE_BITS;
+		bit = 1;
+	}
+
+	return bit;
+}
+
+/* Decode a bittree starting from the most significant bit. */
+static __always_inline uint32_t rc_bittree(struct rc_dec *rc,
+					   uint16_t *probs, uint32_t limit)
+{
+	uint32_t symbol = 1;
+
+	do {
+		if (rc_bit(rc, &probs[symbol]))
+			symbol = (symbol << 1) + 1;
+		else
+			symbol <<= 1;
+	} while (symbol < limit);
+
+	return symbol;
+}
+
+/* Decode a bittree starting from the least significant bit. */
+static __always_inline void rc_bittree_reverse(struct rc_dec *rc,
+					       uint16_t *probs,
+					       uint32_t *dest, uint32_t limit)
+{
+	uint32_t symbol = 1;
+	uint32_t i = 0;
+
+	do {
+		if (rc_bit(rc, &probs[symbol])) {
+			symbol = (symbol << 1) + 1;
+			*dest += 1 << i;
+		} else {
+			symbol <<= 1;
+		}
+	} while (++i < limit);
+}
+
+/* Decode direct bits (fixed fifty-fifty probability) */
+static inline void rc_direct(struct rc_dec *rc, uint32_t *dest, uint32_t limit)
+{
+	uint32_t mask;
+
+	do {
+		rc_normalize(rc);
+		rc->range >>= 1;
+		rc->code -= rc->range;
+		mask = (uint32_t)0 - (rc->code >> 31);
+		rc->code += rc->range & mask;
+		*dest = (*dest << 1) + (mask + 1);
+	} while (--limit > 0);
+}
+
+/********
+ * LZMA *
+ ********/
+
+/* Get pointer to literal coder probability array. */
+static uint16_t *lzma_literal_probs(struct xz_dec_lzma2 *s)
+{
+	uint32_t prev_byte = dict_get(&s->dict, 0);
+	uint32_t low = prev_byte >> (8 - s->lzma.lc);
+	uint32_t high = (s->dict.pos & s->lzma.literal_pos_mask) << s->lzma.lc;
+	return s->lzma.literal[low + high];
+}
+
+/* Decode a literal (one 8-bit byte) */
+static void lzma_literal(struct xz_dec_lzma2 *s)
+{
+	uint16_t *probs;
+	uint32_t symbol;
+	uint32_t match_byte;
+	uint32_t match_bit;
+	uint32_t offset;
+	uint32_t i;
+
+	probs = lzma_literal_probs(s);
+
+	if (lzma_state_is_literal(s->lzma.state)) {
+		symbol = rc_bittree(&s->rc, probs, 0x100);
+	} else {
+		symbol = 1;
+		match_byte = dict_get(&s->dict, s->lzma.rep0) << 1;
+		offset = 0x100;
+
+		do {
+			match_bit = match_byte & offset;
+			match_byte <<= 1;
+			i = offset + match_bit + symbol;
+
+			if (rc_bit(&s->rc, &probs[i])) {
+				symbol = (symbol << 1) + 1;
+				offset &= match_bit;
+			} else {
+				symbol <<= 1;
+				offset &= ~match_bit;
+			}
+		} while (symbol < 0x100);
+	}
+
+	dict_put(&s->dict, (uint8_t)symbol);
+	lzma_state_literal(&s->lzma.state);
+}
+
+/* Decode the length of the match into s->lzma.len. */
+static void lzma_len(struct xz_dec_lzma2 *s, struct lzma_len_dec *l,
+		     uint32_t pos_state)
+{
+	uint16_t *probs;
+	uint32_t limit;
+
+	if (!rc_bit(&s->rc, &l->choice)) {
+		probs = l->low[pos_state];
+		limit = LEN_LOW_SYMBOLS;
+		s->lzma.len = MATCH_LEN_MIN;
+	} else {
+		if (!rc_bit(&s->rc, &l->choice2)) {
+			probs = l->mid[pos_state];
+			limit = LEN_MID_SYMBOLS;
+			s->lzma.len = MATCH_LEN_MIN + LEN_LOW_SYMBOLS;
+		} else {
+			probs = l->high;
+			limit = LEN_HIGH_SYMBOLS;
+			s->lzma.len = MATCH_LEN_MIN + LEN_LOW_SYMBOLS
+					+ LEN_MID_SYMBOLS;
+		}
+	}
+
+	s->lzma.len += rc_bittree(&s->rc, probs, limit) - limit;
+}
+
+/* Decode a match. The distance will be stored in s->lzma.rep0. */
+static void lzma_match(struct xz_dec_lzma2 *s, uint32_t pos_state)
+{
+	uint16_t *probs;
+	uint32_t dist_slot;
+	uint32_t limit;
+
+	lzma_state_match(&s->lzma.state);
+
+	s->lzma.rep3 = s->lzma.rep2;
+	s->lzma.rep2 = s->lzma.rep1;
+	s->lzma.rep1 = s->lzma.rep0;
+
+	lzma_len(s, &s->lzma.match_len_dec, pos_state);
+
+	probs = s->lzma.dist_slot[lzma_get_dist_state(s->lzma.len)];
+	dist_slot = rc_bittree(&s->rc, probs, DIST_SLOTS) - DIST_SLOTS;
+
+	if (dist_slot < DIST_MODEL_START) {
+		s->lzma.rep0 = dist_slot;
+	} else {
+		limit = (dist_slot >> 1) - 1;
+		s->lzma.rep0 = 2 + (dist_slot & 1);
+
+		if (dist_slot < DIST_MODEL_END) {
+			s->lzma.rep0 <<= limit;
+			probs = s->lzma.dist_special + s->lzma.rep0
+					- dist_slot - 1;
+			rc_bittree_reverse(&s->rc, probs,
+					&s->lzma.rep0, limit);
+		} else {
+			rc_direct(&s->rc, &s->lzma.rep0, limit - ALIGN_BITS);
+			s->lzma.rep0 <<= ALIGN_BITS;
+			rc_bittree_reverse(&s->rc, s->lzma.dist_align,
+					&s->lzma.rep0, ALIGN_BITS);
+		}
+	}
+}
+
+/*
+ * Decode a repeated match. The distance is one of the four most recently
+ * seen matches. The distance will be stored in s->lzma.rep0.
+ */
+static void lzma_rep_match(struct xz_dec_lzma2 *s, uint32_t pos_state)
+{
+	uint32_t tmp;
+
+	if (!rc_bit(&s->rc, &s->lzma.is_rep0[s->lzma.state])) {
+		if (!rc_bit(&s->rc, &s->lzma.is_rep0_long[
+				s->lzma.state][pos_state])) {
+			lzma_state_short_rep(&s->lzma.state);
+			s->lzma.len = 1;
+			return;
+		}
+	} else {
+		if (!rc_bit(&s->rc, &s->lzma.is_rep1[s->lzma.state])) {
+			tmp = s->lzma.rep1;
+		} else {
+			if (!rc_bit(&s->rc, &s->lzma.is_rep2[s->lzma.state])) {
+				tmp = s->lzma.rep2;
+			} else {
+				tmp = s->lzma.rep3;
+				s->lzma.rep3 = s->lzma.rep2;
+			}
+
+			s->lzma.rep2 = s->lzma.rep1;
+		}
+
+		s->lzma.rep1 = s->lzma.rep0;
+		s->lzma.rep0 = tmp;
+	}
+
+	lzma_state_long_rep(&s->lzma.state);
+	lzma_len(s, &s->lzma.rep_len_dec, pos_state);
+}
+
+/* LZMA decoder core */
+static bool lzma_main(struct xz_dec_lzma2 *s)
+{
+	uint32_t pos_state;
+
+	/*
+	 * If the dictionary was reached during the previous call, try to
+	 * finish the possibly pending repeat in the dictionary.
+	 */
+	if (dict_has_space(&s->dict) && s->lzma.len > 0)
+		dict_repeat(&s->dict, &s->lzma.len, s->lzma.rep0);
+
+	/*
+	 * Decode more LZMA symbols. One iteration may consume up to
+	 * LZMA_IN_REQUIRED - 1 bytes.
+	 */
+	while (dict_has_space(&s->dict) && !rc_limit_exceeded(&s->rc)) {
+		pos_state = s->dict.pos & s->lzma.pos_mask;
+
+		if (!rc_bit(&s->rc, &s->lzma.is_match[
+				s->lzma.state][pos_state])) {
+			lzma_literal(s);
+		} else {
+			if (rc_bit(&s->rc, &s->lzma.is_rep[s->lzma.state]))
+				lzma_rep_match(s, pos_state);
+			else
+				lzma_match(s, pos_state);
+
+			if (!dict_repeat(&s->dict, &s->lzma.len, s->lzma.rep0))
+				return false;
+		}
+	}
+
+	/*
+	 * Having the range decoder always normalized when we are outside
+	 * this function makes it easier to correctly handle end of the chunk.
+	 */
+	rc_normalize(&s->rc);
+
+	return true;
+}
+
+/*
+ * Reset the LZMA decoder and range decoder state. Dictionary is nore reset
+ * here, because LZMA state may be reset without resetting the dictionary.
+ */
+static void lzma_reset(struct xz_dec_lzma2 *s)
+{
+	uint16_t *probs;
+	size_t i;
+
+	s->lzma.state = STATE_LIT_LIT;
+	s->lzma.rep0 = 0;
+	s->lzma.rep1 = 0;
+	s->lzma.rep2 = 0;
+	s->lzma.rep3 = 0;
+
+	/*
+	 * All probabilities are initialized to the same value. This hack
+	 * makes the code smaller by avoiding a separate loop for each
+	 * probability array.
+	 *
+	 * This could be optimized so that only that part of literal
+	 * probabilities that are actually required. In the common case
+	 * we would write 12 KiB less.
+	 */
+	probs = s->lzma.is_match[0];
+	for (i = 0; i < PROBS_TOTAL; ++i)
+		probs[i] = RC_BIT_MODEL_TOTAL / 2;
+
+	rc_reset(&s->rc);
+}
+
+/*
+ * Decode and validate LZMA properties (lc/lp/pb) and calculate the bit masks
+ * from the decoded lp and pb values. On success, the LZMA decoder state is
+ * reset and true is returned.
+ */
+static bool lzma_props(struct xz_dec_lzma2 *s, uint8_t props)
+{
+	if (props > (4 * 5 + 4) * 9 + 8)
+		return false;
+
+	s->lzma.pos_mask = 0;
+	while (props >= 9 * 5) {
+		props -= 9 * 5;
+		++s->lzma.pos_mask;
+	}
+
+	s->lzma.pos_mask = (1 << s->lzma.pos_mask) - 1;
+
+	s->lzma.literal_pos_mask = 0;
+	while (props >= 9) {
+		props -= 9;
+		++s->lzma.literal_pos_mask;
+	}
+
+	s->lzma.lc = props;
+
+	if (s->lzma.lc + s->lzma.literal_pos_mask > 4)
+		return false;
+
+	s->lzma.literal_pos_mask = (1 << s->lzma.literal_pos_mask) - 1;
+
+	lzma_reset(s);
+
+	return true;
+}
+
+/*********
+ * LZMA2 *
+ *********/
+
+/*
+ * The LZMA decoder assumes that if the input limit (s->rc.in_limit) hasn't
+ * been exceeded, it is safe to read up to LZMA_IN_REQUIRED bytes. This
+ * wrapper function takes care of making the LZMA decoder's assumption safe.
+ *
+ * As long as there is plenty of input left to be decoded in the current LZMA
+ * chunk, we decode directly from the caller-supplied input buffer until
+ * there's LZMA_IN_REQUIRED bytes left. Those remaining bytes are copied into
+ * s->temp.buf, which (hopefully) gets filled on the next call to this
+ * function. We decode a few bytes from the temporary buffer so that we can
+ * continue decoding from the caller-supplied input buffer again.
+ */
+static bool lzma2_lzma(struct xz_dec_lzma2 *s, struct xz_buf *b)
+{
+	size_t in_avail;
+	uint32_t tmp;
+
+	in_avail = b->in_size - b->in_pos;
+	if (s->temp.size > 0 || s->lzma2.compressed == 0) {
+		tmp = 2 * LZMA_IN_REQUIRED - s->temp.size;
+		if (tmp > s->lzma2.compressed - s->temp.size)
+			tmp = s->lzma2.compressed - s->temp.size;
+		if (tmp > in_avail)
+			tmp = in_avail;
+
+		memcpy(s->temp.buf + s->temp.size, b->in + b->in_pos, tmp);
+
+		if (s->temp.size + tmp == s->lzma2.compressed) {
+			memzero(s->temp.buf + s->temp.size + tmp,
+					sizeof(s->temp.buf)
+						- s->temp.size - tmp);
+			s->rc.in_limit = s->temp.size + tmp;
+		} else if (s->temp.size + tmp < LZMA_IN_REQUIRED) {
+			s->temp.size += tmp;
+			b->in_pos += tmp;
+			return true;
+		} else {
+			s->rc.in_limit = s->temp.size + tmp - LZMA_IN_REQUIRED;
+		}
+
+		s->rc.in = s->temp.buf;
+		s->rc.in_pos = 0;
+
+		if (!lzma_main(s) || s->rc.in_pos > s->temp.size + tmp)
+			return false;
+
+		s->lzma2.compressed -= s->rc.in_pos;
+
+		if (s->rc.in_pos < s->temp.size) {
+			s->temp.size -= s->rc.in_pos;
+			memmove(s->temp.buf, s->temp.buf + s->rc.in_pos,
+					s->temp.size);
+			return true;
+		}
+
+		b->in_pos += s->rc.in_pos - s->temp.size;
+		s->temp.size = 0;
+	}
+
+	in_avail = b->in_size - b->in_pos;
+	if (in_avail >= LZMA_IN_REQUIRED) {
+		s->rc.in = b->in;
+		s->rc.in_pos = b->in_pos;
+
+		if (in_avail >= s->lzma2.compressed + LZMA_IN_REQUIRED)
+			s->rc.in_limit = b->in_pos + s->lzma2.compressed;
+		else
+			s->rc.in_limit = b->in_size - LZMA_IN_REQUIRED;
+
+		if (!lzma_main(s))
+			return false;
+
+		in_avail = s->rc.in_pos - b->in_pos;
+		if (in_avail > s->lzma2.compressed)
+			return false;
+
+		s->lzma2.compressed -= in_avail;
+		b->in_pos = s->rc.in_pos;
+	}
+
+	in_avail = b->in_size - b->in_pos;
+	if (in_avail < LZMA_IN_REQUIRED) {
+		if (in_avail > s->lzma2.compressed)
+			in_avail = s->lzma2.compressed;
+
+		memcpy(s->temp.buf, b->in + b->in_pos, in_avail);
+		s->temp.size = in_avail;
+		b->in_pos += in_avail;
+	}
+
+	return true;
+}
+
+/*
+ * Take care of the LZMA2 control layer, and forward the job of actual LZMA
+ * decoding or copying of uncompressed chunks to other functions.
+ */
+XZ_EXTERN enum xz_ret xz_dec_lzma2_run(struct xz_dec_lzma2 *s,
+				       struct xz_buf *b)
+{
+	uint32_t tmp;
+
+	while (b->in_pos < b->in_size || s->lzma2.sequence == SEQ_LZMA_RUN) {
+		switch (s->lzma2.sequence) {
+		case SEQ_CONTROL:
+			/*
+			 * LZMA2 control byte
+			 *
+			 * Exact values:
+			 *   0x00   End marker
+			 *   0x01   Dictionary reset followed by
+			 *          an uncompressed chunk
+			 *   0x02   Uncompressed chunk (no dictionary reset)
+			 *
+			 * Highest three bits (s->control & 0xE0):
+			 *   0xE0   Dictionary reset, new properties and state
+			 *          reset, followed by LZMA compressed chunk
+			 *   0xC0   New properties and state reset, followed
+			 *          by LZMA compressed chunk (no dictionary
+			 *          reset)
+			 *   0xA0   State reset using old properties,
+			 *          followed by LZMA compressed chunk (no
+			 *          dictionary reset)
+			 *   0x80   LZMA chunk (no dictionary or state reset)
+			 *
+			 * For LZMA compressed chunks, the lowest five bits
+			 * (s->control & 1F) are the highest bits of the
+			 * uncompressed size (bits 16-20).
+			 *
+			 * A new LZMA2 stream must begin with a dictionary
+			 * reset. The first LZMA chunk must set new
+			 * properties and reset the LZMA state.
+			 *
+			 * Values that don't match anything described above
+			 * are invalid and we return XZ_DATA_ERROR.
+			 */
+			tmp = b->in[b->in_pos++];
+
+			if (tmp == 0x00)
+				return XZ_STREAM_END;
+
+			if (tmp >= 0xE0 || tmp == 0x01) {
+				s->lzma2.need_props = true;
+				s->lzma2.need_dict_reset = false;
+				dict_reset(&s->dict, b);
+			} else if (s->lzma2.need_dict_reset) {
+				return XZ_DATA_ERROR;
+			}
+
+			if (tmp >= 0x80) {
+				s->lzma2.uncompressed = (tmp & 0x1F) << 16;
+				s->lzma2.sequence = SEQ_UNCOMPRESSED_1;
+
+				if (tmp >= 0xC0) {
+					/*
+					 * When there are new properties,
+					 * state reset is done at
+					 * SEQ_PROPERTIES.
+					 */
+					s->lzma2.need_props = false;
+					s->lzma2.next_sequence
+							= SEQ_PROPERTIES;
+
+				} else if (s->lzma2.need_props) {
+					return XZ_DATA_ERROR;
+
+				} else {
+					s->lzma2.next_sequence
+							= SEQ_LZMA_PREPARE;
+					if (tmp >= 0xA0)
+						lzma_reset(s);
+				}
+			} else {
+				if (tmp > 0x02)
+					return XZ_DATA_ERROR;
+
+				s->lzma2.sequence = SEQ_COMPRESSED_0;
+				s->lzma2.next_sequence = SEQ_COPY;
+			}
+
+			break;
+
+		case SEQ_UNCOMPRESSED_1:
+			s->lzma2.uncompressed
+					+= (uint32_t)b->in[b->in_pos++] << 8;
+			s->lzma2.sequence = SEQ_UNCOMPRESSED_2;
+			break;
+
+		case SEQ_UNCOMPRESSED_2:
+			s->lzma2.uncompressed
+					+= (uint32_t)b->in[b->in_pos++] + 1;
+			s->lzma2.sequence = SEQ_COMPRESSED_0;
+			break;
+
+		case SEQ_COMPRESSED_0:
+			s->lzma2.compressed
+					= (uint32_t)b->in[b->in_pos++] << 8;
+			s->lzma2.sequence = SEQ_COMPRESSED_1;
+			break;
+
+		case SEQ_COMPRESSED_1:
+			s->lzma2.compressed
+					+= (uint32_t)b->in[b->in_pos++] + 1;
+			s->lzma2.sequence = s->lzma2.next_sequence;
+			break;
+
+		case SEQ_PROPERTIES:
+			if (!lzma_props(s, b->in[b->in_pos++]))
+				return XZ_DATA_ERROR;
+
+			s->lzma2.sequence = SEQ_LZMA_PREPARE;
+
+		/* Fall through */
+
+		case SEQ_LZMA_PREPARE:
+			if (s->lzma2.compressed < RC_INIT_BYTES)
+				return XZ_DATA_ERROR;
+
+			if (!rc_read_init(&s->rc, b))
+				return XZ_OK;
+
+			s->lzma2.compressed -= RC_INIT_BYTES;
+			s->lzma2.sequence = SEQ_LZMA_RUN;
+
+		/* Fall through */
+
+		case SEQ_LZMA_RUN:
+			/*
+			 * Set dictionary limit to indicate how much we want
+			 * to be encoded at maximum. Decode new data into the
+			 * dictionary. Flush the new data from dictionary to
+			 * b->out. Check if we finished decoding this chunk.
+			 * In case the dictionary got full but we didn't fill
+			 * the output buffer yet, we may run this loop
+			 * multiple times without changing s->lzma2.sequence.
+			 */
+			dict_limit(&s->dict, min_t(size_t,
+					b->out_size - b->out_pos,
+					s->lzma2.uncompressed));
+			if (!lzma2_lzma(s, b))
+				return XZ_DATA_ERROR;
+
+			s->lzma2.uncompressed -= dict_flush(&s->dict, b);
+
+			if (s->lzma2.uncompressed == 0) {
+				if (s->lzma2.compressed > 0 || s->lzma.len > 0
+						|| !rc_is_finished(&s->rc))
+					return XZ_DATA_ERROR;
+
+				rc_reset(&s->rc);
+				s->lzma2.sequence = SEQ_CONTROL;
+
+			} else if (b->out_pos == b->out_size
+					|| (b->in_pos == b->in_size
+						&& s->temp.size
+						< s->lzma2.compressed)) {
+				return XZ_OK;
+			}
+
+			break;
+
+		case SEQ_COPY:
+			dict_uncompressed(&s->dict, b, &s->lzma2.compressed);
+			if (s->lzma2.compressed > 0)
+				return XZ_OK;
+
+			s->lzma2.sequence = SEQ_CONTROL;
+			break;
+		}
+	}
+
+	return XZ_OK;
+}
+
+XZ_EXTERN struct xz_dec_lzma2 *xz_dec_lzma2_create(enum xz_mode mode,
+						   uint32_t dict_max)
+{
+	struct xz_dec_lzma2 *s = kmalloc(sizeof(*s), GFP_KERNEL);
+	if (s == NULL)
+		return NULL;
+
+	s->dict.mode = mode;
+	s->dict.size_max = dict_max;
+
+	if (DEC_IS_PREALLOC(mode)) {
+		s->dict.buf = vmalloc(dict_max);
+		if (s->dict.buf == NULL) {
+			kfree(s);
+			return NULL;
+		}
+	} else if (DEC_IS_DYNALLOC(mode)) {
+		s->dict.buf = NULL;
+		s->dict.allocated = 0;
+	}
+
+	return s;
+}
+
+XZ_EXTERN enum xz_ret xz_dec_lzma2_reset(struct xz_dec_lzma2 *s, uint8_t props)
+{
+	/* This limits dictionary size to 3 GiB to keep parsing simpler. */
+	if (props > 39)
+		return XZ_OPTIONS_ERROR;
+
+	s->dict.size = 2 + (props & 1);
+	s->dict.size <<= (props >> 1) + 11;
+
+	if (DEC_IS_MULTI(s->dict.mode)) {
+		if (s->dict.size > s->dict.size_max)
+			return XZ_MEMLIMIT_ERROR;
+
+		s->dict.end = s->dict.size;
+
+		if (DEC_IS_DYNALLOC(s->dict.mode)) {
+			if (s->dict.allocated < s->dict.size) {
+				vfree(s->dict.buf);
+				s->dict.buf = vmalloc(s->dict.size);
+				if (s->dict.buf == NULL) {
+					s->dict.allocated = 0;
+					return XZ_MEM_ERROR;
+				}
+			}
+		}
+	}
+
+	s->lzma.len = 0;
+
+	s->lzma2.sequence = SEQ_CONTROL;
+	s->lzma2.need_dict_reset = true;
+
+	s->temp.size = 0;
+
+	return XZ_OK;
+}
+
+XZ_EXTERN void xz_dec_lzma2_end(struct xz_dec_lzma2 *s)
+{
+	if (DEC_IS_MULTI(s->dict.mode))
+		vfree(s->dict.buf);
+
+	kfree(s);
+}
+
+/* Hash used to validate the Index field */
+struct xz_dec_hash {
+	vli_type unpadded;
+	vli_type uncompressed;
+	uint32_t crc32;
+};
+
+struct xz_dec {
+	/* Position in dec_main() */
+	enum {
+		SEQ_STREAM_HEADER,
+		SEQ_BLOCK_START,
+		SEQ_BLOCK_HEADER,
+		SEQ_BLOCK_UNCOMPRESS,
+		SEQ_BLOCK_PADDING,
+		SEQ_BLOCK_CHECK,
+		SEQ_INDEX,
+		SEQ_INDEX_PADDING,
+		SEQ_INDEX_CRC32,
+		SEQ_STREAM_FOOTER
+	} sequence;
+
+	/* Position in variable-length integers and Check fields */
+	uint32_t pos;
+
+	/* Variable-length integer decoded by dec_vli() */
+	vli_type vli;
+
+	/* Saved in_pos and out_pos */
+	size_t in_start;
+	size_t out_start;
+
+	/* CRC32 value in Block or Index */
+	uint32_t crc32;
+
+	/* Type of the integrity check calculated from uncompressed data */
+	enum xz_check check_type;
+
+	/* Operation mode */
+	enum xz_mode mode;
+
+	/*
+	 * True if the next call to xz_dec_run() is allowed to return
+	 * XZ_BUF_ERROR.
+	 */
+	bool allow_buf_error;
+
+	/* Information stored in Block Header */
+	struct {
+		/*
+		 * Value stored in the Compressed Size field, or
+		 * VLI_UNKNOWN if Compressed Size is not present.
+		 */
+		vli_type compressed;
+
+		/*
+		 * Value stored in the Uncompressed Size field, or
+		 * VLI_UNKNOWN if Uncompressed Size is not present.
+		 */
+		vli_type uncompressed;
+
+		/* Size of the Block Header field */
+		uint32_t size;
+	} block_header;
+
+	/* Information collected when decoding Blocks */
+	struct {
+		/* Observed compressed size of the current Block */
+		vli_type compressed;
+
+		/* Observed uncompressed size of the current Block */
+		vli_type uncompressed;
+
+		/* Number of Blocks decoded so far */
+		vli_type count;
+
+		/*
+		 * Hash calculated from the Block sizes. This is used to
+		 * validate the Index field.
+		 */
+		struct xz_dec_hash hash;
+	} block;
+
+	/* Variables needed when verifying the Index field */
+	struct {
+		/* Position in dec_index() */
+		enum {
+			SEQ_INDEX_COUNT,
+			SEQ_INDEX_UNPADDED,
+			SEQ_INDEX_UNCOMPRESSED
+		} sequence;
+
+		/* Size of the Index in bytes */
+		vli_type size;
+
+		/* Number of Records (matches block.count in valid files) */
+		vli_type count;
+
+		/*
+		 * Hash calculated from the Records (matches block.hash in
+		 * valid files).
+		 */
+		struct xz_dec_hash hash;
+	} index;
+
+	/*
+	 * Temporary buffer needed to hold Stream Header, Block Header,
+	 * and Stream Footer. The Block Header is the biggest (1 KiB)
+	 * so we reserve space according to that. buf[] has to be aligned
+	 * to a multiple of four bytes; the size_t variables before it
+	 * should guarantee this.
+	 */
+	struct {
+		size_t pos;
+		size_t size;
+		uint8_t buf[1024];
+	} temp;
+
+	struct xz_dec_lzma2 *lzma2;
+
+#ifdef XZ_DEC_BCJ
+	struct xz_dec_bcj *bcj;
+	bool bcj_active;
+#endif
+};
+
+#ifdef XZ_DEC_ANY_CHECK
+/* Sizes of the Check field with different Check IDs */
+static const uint8_t check_sizes[16] = {
+	0,
+	4, 4, 4,
+	8, 8, 8,
+	16, 16, 16,
+	32, 32, 32,
+	64, 64, 64
+};
+#endif
+
+/*
+ * Fill s->temp by copying data starting from b->in[b->in_pos]. Caller
+ * must have set s->temp.pos to indicate how much data we are supposed
+ * to copy into s->temp.buf. Return true once s->temp.pos has reached
+ * s->temp.size.
+ */
+static bool fill_temp(struct xz_dec *s, struct xz_buf *b)
+{
+	size_t copy_size = min_t(size_t,
+			b->in_size - b->in_pos, s->temp.size - s->temp.pos);
+
+	memcpy(s->temp.buf + s->temp.pos, b->in + b->in_pos, copy_size);
+	b->in_pos += copy_size;
+	s->temp.pos += copy_size;
+
+	if (s->temp.pos == s->temp.size) {
+		s->temp.pos = 0;
+		return true;
+	}
+
+	return false;
+}
+
+/* Decode a variable-length integer (little-endian base-128 encoding) */
+static enum xz_ret dec_vli(struct xz_dec *s, const uint8_t *in,
+			   size_t *in_pos, size_t in_size)
+{
+	uint8_t byte;
+
+	if (s->pos == 0)
+		s->vli = 0;
+
+	while (*in_pos < in_size) {
+		byte = in[*in_pos];
+		++*in_pos;
+
+		s->vli |= (vli_type)(byte & 0x7F) << s->pos;
+
+		if ((byte & 0x80) == 0) {
+			/* Don't allow non-minimal encodings. */
+			if (byte == 0 && s->pos != 0)
+				return XZ_DATA_ERROR;
+
+			s->pos = 0;
+			return XZ_STREAM_END;
+		}
+
+		s->pos += 7;
+		if (s->pos == 7 * VLI_BYTES_MAX)
+			return XZ_DATA_ERROR;
+	}
+
+	return XZ_OK;
+}
+
+/*
+ * Decode the Compressed Data field from a Block. Update and validate
+ * the observed compressed and uncompressed sizes of the Block so that
+ * they don't exceed the values possibly stored in the Block Header
+ * (validation assumes that no integer overflow occurs, since vli_type
+ * is normally uint64_t). Update the CRC32 if presence of the CRC32
+ * field was indicated in Stream Header.
+ *
+ * Once the decoding is finished, validate that the observed sizes match
+ * the sizes possibly stored in the Block Header. Update the hash and
+ * Block count, which are later used to validate the Index field.
+ */
+static enum xz_ret dec_block(struct xz_dec *s, struct xz_buf *b)
+{
+	enum xz_ret ret;
+
+	s->in_start = b->in_pos;
+	s->out_start = b->out_pos;
+
+#ifdef XZ_DEC_BCJ
+	if (s->bcj_active)
+		ret = xz_dec_bcj_run(s->bcj, s->lzma2, b);
+	else
+#endif
+		ret = xz_dec_lzma2_run(s->lzma2, b);
+
+	s->block.compressed += b->in_pos - s->in_start;
+	s->block.uncompressed += b->out_pos - s->out_start;
+
+	/*
+	 * There is no need to separately check for VLI_UNKNOWN, since
+	 * the observed sizes are always smaller than VLI_UNKNOWN.
+	 */
+	if (s->block.compressed > s->block_header.compressed
+			|| s->block.uncompressed
+				> s->block_header.uncompressed)
+		return XZ_DATA_ERROR;
+
+	if (s->check_type == XZ_CHECK_CRC32)
+		s->crc32 = xz_crc32(b->out + s->out_start,
+				b->out_pos - s->out_start, s->crc32);
+
+	if (ret == XZ_STREAM_END) {
+		if (s->block_header.compressed != VLI_UNKNOWN
+				&& s->block_header.compressed
+					!= s->block.compressed)
+			return XZ_DATA_ERROR;
+
+		if (s->block_header.uncompressed != VLI_UNKNOWN
+				&& s->block_header.uncompressed
+					!= s->block.uncompressed)
+			return XZ_DATA_ERROR;
+
+		s->block.hash.unpadded += s->block_header.size
+				+ s->block.compressed;
+
+#ifdef XZ_DEC_ANY_CHECK
+		s->block.hash.unpadded += check_sizes[s->check_type];
+#else
+		if (s->check_type == XZ_CHECK_CRC32)
+			s->block.hash.unpadded += 4;
+#endif
+
+		s->block.hash.uncompressed += s->block.uncompressed;
+		s->block.hash.crc32 = xz_crc32(
+				(const uint8_t *)&s->block.hash,
+				sizeof(s->block.hash), s->block.hash.crc32);
+
+		++s->block.count;
+	}
+
+	return ret;
+}
+
+/* Update the Index size and the CRC32 value. */
+static void index_update(struct xz_dec *s, const struct xz_buf *b)
+{
+	size_t in_used = b->in_pos - s->in_start;
+	s->index.size += in_used;
+	s->crc32 = xz_crc32(b->in + s->in_start, in_used, s->crc32);
+}
+
+/*
+ * Decode the Number of Records, Unpadded Size, and Uncompressed Size
+ * fields from the Index field. That is, Index Padding and CRC32 are not
+ * decoded by this function.
+ *
+ * This can return XZ_OK (more input needed), XZ_STREAM_END (everything
+ * successfully decoded), or XZ_DATA_ERROR (input is corrupt).
+ */
+static enum xz_ret dec_index(struct xz_dec *s, struct xz_buf *b)
+{
+	enum xz_ret ret;
+
+	do {
+		ret = dec_vli(s, b->in, &b->in_pos, b->in_size);
+		if (ret != XZ_STREAM_END) {
+			index_update(s, b);
+			return ret;
+		}
+
+		switch (s->index.sequence) {
+		case SEQ_INDEX_COUNT:
+			s->index.count = s->vli;
+
+			/*
+			 * Validate that the Number of Records field
+			 * indicates the same number of Records as
+			 * there were Blocks in the Stream.
+			 */
+			if (s->index.count != s->block.count)
+				return XZ_DATA_ERROR;
+
+			s->index.sequence = SEQ_INDEX_UNPADDED;
+			break;
+
+		case SEQ_INDEX_UNPADDED:
+			s->index.hash.unpadded += s->vli;
+			s->index.sequence = SEQ_INDEX_UNCOMPRESSED;
+			break;
+
+		case SEQ_INDEX_UNCOMPRESSED:
+			s->index.hash.uncompressed += s->vli;
+			s->index.hash.crc32 = xz_crc32(
+					(const uint8_t *)&s->index.hash,
+					sizeof(s->index.hash),
+					s->index.hash.crc32);
+			--s->index.count;
+			s->index.sequence = SEQ_INDEX_UNPADDED;
+			break;
+		}
+	} while (s->index.count > 0);
+
+	return XZ_STREAM_END;
+}
+
+/*
+ * Validate that the next four input bytes match the value of s->crc32.
+ * s->pos must be zero when starting to validate the first byte.
+ */
+static enum xz_ret crc32_validate(struct xz_dec *s, struct xz_buf *b)
+{
+	do {
+		if (b->in_pos == b->in_size)
+			return XZ_OK;
+
+		if (((s->crc32 >> s->pos) & 0xFF) != b->in[b->in_pos++])
+			return XZ_DATA_ERROR;
+
+		s->pos += 8;
+
+	} while (s->pos < 32);
+
+	s->crc32 = 0;
+	s->pos = 0;
+
+	return XZ_STREAM_END;
+}
+
+#ifdef XZ_DEC_ANY_CHECK
+/*
+ * Skip over the Check field when the Check ID is not supported.
+ * Returns true once the whole Check field has been skipped over.
+ */
+static bool check_skip(struct xz_dec *s, struct xz_buf *b)
+{
+	while (s->pos < check_sizes[s->check_type]) {
+		if (b->in_pos == b->in_size)
+			return false;
+
+		++b->in_pos;
+		++s->pos;
+	}
+
+	s->pos = 0;
+
+	return true;
+}
+#endif
+
+/* Decode the Stream Header field (the first 12 bytes of the .xz Stream). */
+static enum xz_ret dec_stream_header(struct xz_dec *s)
+{
+	if (!memeq(s->temp.buf, HEADER_MAGIC, HEADER_MAGIC_SIZE))
+		return XZ_FORMAT_ERROR;
+
+	if (xz_crc32(s->temp.buf + HEADER_MAGIC_SIZE, 2, 0)
+			!= get_le32(s->temp.buf + HEADER_MAGIC_SIZE + 2))
+		return XZ_DATA_ERROR;
+
+	if (s->temp.buf[HEADER_MAGIC_SIZE] != 0)
+		return XZ_OPTIONS_ERROR;
+
+	/*
+	 * Of integrity checks, we support only none (Check ID = 0) and
+	 * CRC32 (Check ID = 1). However, if XZ_DEC_ANY_CHECK is defined,
+	 * we will accept other check types too, but then the check won't
+	 * be verified and a warning (XZ_UNSUPPORTED_CHECK) will be given.
+	 */
+	s->check_type = s->temp.buf[HEADER_MAGIC_SIZE + 1];
+
+#ifdef XZ_DEC_ANY_CHECK
+	if (s->check_type > XZ_CHECK_MAX)
+		return XZ_OPTIONS_ERROR;
+
+	if (s->check_type > XZ_CHECK_CRC32)
+		return XZ_UNSUPPORTED_CHECK;
+#else
+	if (s->check_type > XZ_CHECK_CRC32)
+		return XZ_OPTIONS_ERROR;
+#endif
+
+	return XZ_OK;
+}
+
+/* Decode the Stream Footer field (the last 12 bytes of the .xz Stream) */
+static enum xz_ret dec_stream_footer(struct xz_dec *s)
+{
+	if (!memeq(s->temp.buf + 10, FOOTER_MAGIC, FOOTER_MAGIC_SIZE))
+		return XZ_DATA_ERROR;
+
+	if (xz_crc32(s->temp.buf + 4, 6, 0) != get_le32(s->temp.buf))
+		return XZ_DATA_ERROR;
+
+	/*
+	 * Validate Backward Size. Note that we never added the size of the
+	 * Index CRC32 field to s->index.size, thus we use s->index.size / 4
+	 * instead of s->index.size / 4 - 1.
+	 */
+	if ((s->index.size >> 2) != get_le32(s->temp.buf + 4))
+		return XZ_DATA_ERROR;
+
+	if (s->temp.buf[8] != 0 || s->temp.buf[9] != s->check_type)
+		return XZ_DATA_ERROR;
+
+	/*
+	 * Use XZ_STREAM_END instead of XZ_OK to be more convenient
+	 * for the caller.
+	 */
+	return XZ_STREAM_END;
+}
+
+/* Decode the Block Header and initialize the filter chain. */
+static enum xz_ret dec_block_header(struct xz_dec *s)
+{
+	enum xz_ret ret;
+
+	/*
+	 * Validate the CRC32. We know that the temp buffer is at least
+	 * eight bytes so this is safe.
+	 */
+	s->temp.size -= 4;
+	if (xz_crc32(s->temp.buf, s->temp.size, 0)
+			!= get_le32(s->temp.buf + s->temp.size))
+		return XZ_DATA_ERROR;
+
+	s->temp.pos = 2;
+
+	/*
+	 * Catch unsupported Block Flags. We support only one or two filters
+	 * in the chain, so we catch that with the same test.
+	 */
+#ifdef XZ_DEC_BCJ
+	if (s->temp.buf[1] & 0x3E)
+#else
+	if (s->temp.buf[1] & 0x3F)
+#endif
+		return XZ_OPTIONS_ERROR;
+
+	/* Compressed Size */
+	if (s->temp.buf[1] & 0x40) {
+		if (dec_vli(s, s->temp.buf, &s->temp.pos, s->temp.size)
+					!= XZ_STREAM_END)
+			return XZ_DATA_ERROR;
+
+		s->block_header.compressed = s->vli;
+	} else {
+		s->block_header.compressed = VLI_UNKNOWN;
+	}
+
+	/* Uncompressed Size */
+	if (s->temp.buf[1] & 0x80) {
+		if (dec_vli(s, s->temp.buf, &s->temp.pos, s->temp.size)
+				!= XZ_STREAM_END)
+			return XZ_DATA_ERROR;
+
+		s->block_header.uncompressed = s->vli;
+	} else {
+		s->block_header.uncompressed = VLI_UNKNOWN;
+	}
+
+#ifdef XZ_DEC_BCJ
+	/* If there are two filters, the first one must be a BCJ filter. */
+	s->bcj_active = s->temp.buf[1] & 0x01;
+	if (s->bcj_active) {
+		if (s->temp.size - s->temp.pos < 2)
+			return XZ_OPTIONS_ERROR;
+
+		ret = xz_dec_bcj_reset(s->bcj, s->temp.buf[s->temp.pos++]);
+		if (ret != XZ_OK)
+			return ret;
+
+		/*
+		 * We don't support custom start offset,
+		 * so Size of Properties must be zero.
+		 */
+		if (s->temp.buf[s->temp.pos++] != 0x00)
+			return XZ_OPTIONS_ERROR;
+	}
+#endif
+
+	/* Valid Filter Flags always take at least two bytes. */
+	if (s->temp.size - s->temp.pos < 2)
+		return XZ_DATA_ERROR;
+
+	/* Filter ID = LZMA2 */
+	if (s->temp.buf[s->temp.pos++] != 0x21)
+		return XZ_OPTIONS_ERROR;
+
+	/* Size of Properties = 1-byte Filter Properties */
+	if (s->temp.buf[s->temp.pos++] != 0x01)
+		return XZ_OPTIONS_ERROR;
+
+	/* Filter Properties contains LZMA2 dictionary size. */
+	if (s->temp.size - s->temp.pos < 1)
+		return XZ_DATA_ERROR;
+
+	ret = xz_dec_lzma2_reset(s->lzma2, s->temp.buf[s->temp.pos++]);
+	if (ret != XZ_OK)
+		return ret;
+
+	/* The rest must be Header Padding. */
+	while (s->temp.pos < s->temp.size)
+		if (s->temp.buf[s->temp.pos++] != 0x00)
+			return XZ_OPTIONS_ERROR;
+
+	s->temp.pos = 0;
+	s->block.compressed = 0;
+	s->block.uncompressed = 0;
+
+	return XZ_OK;
+}
+
+static enum xz_ret dec_main(struct xz_dec *s, struct xz_buf *b)
+{
+	enum xz_ret ret;
+
+	/*
+	 * Store the start position for the case when we are in the middle
+	 * of the Index field.
+	 */
+	s->in_start = b->in_pos;
+
+	while (true) {
+		switch (s->sequence) {
+		case SEQ_STREAM_HEADER:
+			/*
+			 * Stream Header is copied to s->temp, and then
+			 * decoded from there. This way if the caller
+			 * gives us only little input at a time, we can
+			 * still keep the Stream Header decoding code
+			 * simple. Similar approach is used in many places
+			 * in this file.
+			 */
+			if (!fill_temp(s, b))
+				return XZ_OK;
+
+			/*
+			 * If dec_stream_header() returns
+			 * XZ_UNSUPPORTED_CHECK, it is still possible
+			 * to continue decoding if working in multi-call
+			 * mode. Thus, update s->sequence before calling
+			 * dec_stream_header().
+			 */
+			s->sequence = SEQ_BLOCK_START;
+
+			ret = dec_stream_header(s);
+			if (ret != XZ_OK)
+				return ret;
+
+		/* Fall through */
+
+		case SEQ_BLOCK_START:
+			/* We need one byte of input to continue. */
+			if (b->in_pos == b->in_size)
+				return XZ_OK;
+
+			/* See if this is the beginning of the Index field. */
+			if (b->in[b->in_pos] == 0) {
+				s->in_start = b->in_pos++;
+				s->sequence = SEQ_INDEX;
+				break;
+			}
+
+			/*
+			 * Calculate the size of the Block Header and
+			 * prepare to decode it.
+			 */
+			s->block_header.size
+				= ((uint32_t)b->in[b->in_pos] + 1) * 4;
+
+			s->temp.size = s->block_header.size;
+			s->temp.pos = 0;
+			s->sequence = SEQ_BLOCK_HEADER;
+
+		/* Fall through */
+
+		case SEQ_BLOCK_HEADER:
+			if (!fill_temp(s, b))
+				return XZ_OK;
+
+			ret = dec_block_header(s);
+			if (ret != XZ_OK)
+				return ret;
+
+			s->sequence = SEQ_BLOCK_UNCOMPRESS;
+
+		/* Fall through */
+
+		case SEQ_BLOCK_UNCOMPRESS:
+			ret = dec_block(s, b);
+			if (ret != XZ_STREAM_END)
+				return ret;
+
+			s->sequence = SEQ_BLOCK_PADDING;
+
+		/* Fall through */
+
+		case SEQ_BLOCK_PADDING:
+			/*
+			 * Size of Compressed Data + Block Padding
+			 * must be a multiple of four. We don't need
+			 * s->block.compressed for anything else
+			 * anymore, so we use it here to test the size
+			 * of the Block Padding field.
+			 */
+			while (s->block.compressed & 3) {
+				if (b->in_pos == b->in_size)
+					return XZ_OK;
+
+				if (b->in[b->in_pos++] != 0)
+					return XZ_DATA_ERROR;
+
+				++s->block.compressed;
+			}
+
+			s->sequence = SEQ_BLOCK_CHECK;
+
+		/* Fall through */
+
+		case SEQ_BLOCK_CHECK:
+			if (s->check_type == XZ_CHECK_CRC32) {
+				ret = crc32_validate(s, b);
+				if (ret != XZ_STREAM_END)
+					return ret;
+			}
+#ifdef XZ_DEC_ANY_CHECK
+			else if (!check_skip(s, b)) {
+				return XZ_OK;
+			}
+#endif
+
+			s->sequence = SEQ_BLOCK_START;
+			break;
+
+		case SEQ_INDEX:
+			ret = dec_index(s, b);
+			if (ret != XZ_STREAM_END)
+				return ret;
+
+			s->sequence = SEQ_INDEX_PADDING;
+
+		/* Fall through */
+
+		case SEQ_INDEX_PADDING:
+			while ((s->index.size + (b->in_pos - s->in_start))
+					& 3) {
+				if (b->in_pos == b->in_size) {
+					index_update(s, b);
+					return XZ_OK;
+				}
+
+				if (b->in[b->in_pos++] != 0)
+					return XZ_DATA_ERROR;
+			}
+
+			/* Finish the CRC32 value and Index size. */
+			index_update(s, b);
+
+			/* Compare the hashes to validate the Index field. */
+			if (!memeq(&s->block.hash, &s->index.hash,
+					sizeof(s->block.hash)))
+				return XZ_DATA_ERROR;
+
+			s->sequence = SEQ_INDEX_CRC32;
+
+		/* Fall through */
+
+		case SEQ_INDEX_CRC32:
+			ret = crc32_validate(s, b);
+			if (ret != XZ_STREAM_END)
+				return ret;
+
+			s->temp.size = STREAM_HEADER_SIZE;
+			s->sequence = SEQ_STREAM_FOOTER;
+
+		/* Fall through */
+
+		case SEQ_STREAM_FOOTER:
+			if (!fill_temp(s, b))
+				return XZ_OK;
+
+			return dec_stream_footer(s);
+		}
+	}
+
+	/* Never reached */
+}
+
+/*
+ * xz_dec_run() is a wrapper for dec_main() to handle some special cases in
+ * multi-call and single-call decoding.
+ *
+ * In multi-call mode, we must return XZ_BUF_ERROR when it seems clear that we
+ * are not going to make any progress anymore. This is to prevent the caller
+ * from calling us infinitely when the input file is truncated or otherwise
+ * corrupt. Since zlib-style API allows that the caller fills the input buffer
+ * only when the decoder doesn't produce any new output, we have to be careful
+ * to avoid returning XZ_BUF_ERROR too easily: XZ_BUF_ERROR is returned only
+ * after the second consecutive call to xz_dec_run() that makes no progress.
+ *
+ * In single-call mode, if we couldn't decode everything and no error
+ * occurred, either the input is truncated or the output buffer is too small.
+ * Since we know that the last input byte never produces any output, we know
+ * that if all the input was consumed and decoding wasn't finished, the file
+ * must be corrupt. Otherwise the output buffer has to be too small or the
+ * file is corrupt in a way that decoding it produces too big output.
+ *
+ * If single-call decoding fails, we reset b->in_pos and b->out_pos back to
+ * their original values. This is because with some filter chains there won't
+ * be any valid uncompressed data in the output buffer unless the decoding
+ * actually succeeds (that's the price to pay of using the output buffer as
+ * the workspace).
+ */
+XZ_EXTERN enum xz_ret xz_dec_run(struct xz_dec *s, struct xz_buf *b)
+{
+	size_t in_start;
+	size_t out_start;
+	enum xz_ret ret;
+
+	if (DEC_IS_SINGLE(s->mode))
+		xz_dec_reset(s);
+
+	in_start = b->in_pos;
+	out_start = b->out_pos;
+	ret = dec_main(s, b);
+
+	if (DEC_IS_SINGLE(s->mode)) {
+		if (ret == XZ_OK)
+			ret = b->in_pos == b->in_size
+					? XZ_DATA_ERROR : XZ_BUF_ERROR;
+
+		if (ret != XZ_STREAM_END) {
+			b->in_pos = in_start;
+			b->out_pos = out_start;
+		}
+
+	} else if (ret == XZ_OK && in_start == b->in_pos
+			&& out_start == b->out_pos) {
+		if (s->allow_buf_error)
+			ret = XZ_BUF_ERROR;
+
+		s->allow_buf_error = true;
+	} else {
+		s->allow_buf_error = false;
+	}
+
+	return ret;
+}
+
+XZ_EXTERN struct xz_dec *xz_dec_init(enum xz_mode mode, uint32_t dict_max)
+{
+	struct xz_dec *s = kmalloc(sizeof(*s), GFP_KERNEL);
+	if (s == NULL)
+		return NULL;
+
+	s->mode = mode;
+
+#ifdef XZ_DEC_BCJ
+	s->bcj = xz_dec_bcj_create(DEC_IS_SINGLE(mode));
+	if (s->bcj == NULL)
+		goto error_bcj;
+#endif
+
+	s->lzma2 = xz_dec_lzma2_create(mode, dict_max);
+	if (s->lzma2 == NULL)
+		goto error_lzma2;
+
+	xz_dec_reset(s);
+	return s;
+
+error_lzma2:
+#ifdef XZ_DEC_BCJ
+	xz_dec_bcj_end(s->bcj);
+error_bcj:
+#endif
+	kfree(s);
+	return NULL;
+}
+
+XZ_EXTERN void xz_dec_reset(struct xz_dec *s)
+{
+	s->sequence = SEQ_STREAM_HEADER;
+	s->allow_buf_error = false;
+	s->pos = 0;
+	s->crc32 = 0;
+	memzero(&s->block, sizeof(s->block));
+	memzero(&s->index, sizeof(s->index));
+	s->temp.pos = 0;
+	s->temp.size = STREAM_HEADER_SIZE;
+}
+
+XZ_EXTERN void xz_dec_end(struct xz_dec *s)
+{
+	if (s != NULL) {
+		xz_dec_lzma2_end(s->lzma2);
+#ifdef XZ_DEC_BCJ
+		xz_dec_bcj_end(s->bcj);
+#endif
+		kfree(s);
+	}
+}
